@@ -1,0 +1,50 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Build
+        working-directory: App
+        run: swift build 2>&1 | tee build.log
+
+      # Compiler output is the useful artefact here: if the build fails, the
+      # errors are readable straight from the Actions log without anyone having
+      # to reproduce it locally.
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: App/build.log
+
+  anki-roundtrip:
+    name: Anki round-trip
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Anki and genanki
+        run: pip install anki genanki
+
+      # Proves the exported .apkg still merges into a real collection without
+      # losing review history. This is the test that matters.
+      - name: Round-trip
+        working-directory: Tests/AnkiRoundTrip
+        run: python3 test_roundtrip.py

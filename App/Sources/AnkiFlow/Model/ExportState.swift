@@ -1,0 +1,87 @@
+import Foundation
+
+/// What an export actually did, shown on the export sheet.
+///
+/// There is no central export database. Each lecture's `.ankiflow.json` carries
+/// its own history -- which deck it last went to, and which of its questions
+/// have been deleted since. That works because a question belongs to *one* PDF:
+/// it cites that PDF's pages, so it cannot move to another lecture. The only
+/// thing that moves is the lecture file itself, and a lecture always knows
+/// where it last went.
+/// How far a "forget what was exported" action reaches.
+enum ResetScope: String, CaseIterable, Identifiable {
+    case lecture, folder, library
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .lecture: return "This lecture"
+        case .folder:  return "This folder"
+        case .library: return "Whole library"
+        }
+    }
+}
+
+/// Where an export goes. All three produce the same questions; they differ in
+/// what lands and where.
+enum ExportDestination: String, CaseIterable, Identifiable {
+    /// First because it is what you want when it works: no dialog, no import
+    /// screen. Falls back to the package when Anki isn't answering.
+    case anki
+    /// A file. The only one that needs nothing else installed.
+    case package
+    /// The lectures themselves — PDFs plus question files — zipped.
+    case archive
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .anki:    return "Straight into Anki"
+        case .package: return "Anki package (.apkg)"
+        case .archive: return "Lectures + questions (.zip)"
+        }
+    }
+}
+
+struct ExportSummary {
+    var deckCount: Int = 0
+    var newNotes: Int = 0
+    var changedNotes: Int = 0
+    var unchangedNotes: Int = 0
+    var mediaFiles: Int = 0
+    var packageURL: URL?
+
+    /// Questions removed from a lecture since it was last exported. Anki will
+    /// not delete these; the sheet offers a search that selects them.
+    var retired: [(qid: String, lecture: String)] = []
+    /// Lectures whose folder changed. Anki will not move their cards either.
+    var moved: [(lecture: String, from: String, to: String)] = []
+
+    var totalNotes: Int { newNotes + changedNotes + unchangedNotes }
+
+    /// Paste into Anki's browser to select every card of a removed question.
+    var retiredSearch: String {
+        guard !retired.isEmpty else { return "" }
+        // QID:"value" -- the value is quoted, not the whole term, or Anki reads
+        // it as a search for literal text rather than as a field match.
+        let clause = retired.map { "QID:\"\($0.qid)\"" }.joined(separator: " OR ")
+        return "\"note:\(AnkiIdentity.noteTypeName)\" (\(clause))"
+    }
+
+    /// Selects the cards that should be moved, then use Change Deck.
+    ///
+    /// Searches the *new* path tag, not the old one. Tags are rewritten on
+    /// import while deck placement is not — that asymmetry is the whole reason
+    /// this report exists — so after the export these cards already carry the
+    /// new tag and are still sitting in the old deck. The old tag no longer
+    /// exists on them, and searching for it found nothing.
+    func moveSearches() -> [(to: String, search: String)] {
+        moved.map { move in (to: move.to, search: Self.moveSearch(to: move.to)) }
+    }
+
+    static func moveSearch(to deck: String) -> String {
+        let tag = deck.replacingOccurrences(of: " ", with: "-")
+        return "\"note:\(AnkiIdentity.noteTypeName)\" \"tag:\(tag)\" -\"deck:\(deck)\""
+    }
+}

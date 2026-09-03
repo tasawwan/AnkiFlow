@@ -1,0 +1,42 @@
+# ── Build output ──────────────────────────────────────────────────────────
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+App/AnkiFlow.app/
+App/*.dmg
+App/build.log
+
+# ── Signing material. Never commit these. ─────────────────────────────────
+# A leaked .p12 lets anyone ship software signed as you.
+*.p12
+*.cer
+*.certSigningRequest
+*.provisionprofile
+*.mobileprovision
+
+# ── Your study material and anything derived from it ──────────────────────
+# The app stores questions beside each PDF and its own files in .ankiflow/.
+# None of that belongs in a public repo: the questions are yours, and the
+# rendered slides are your school's copyrighted lecture material.
+*.ankiflow.json
+.ankiflow/
+*.apkg
+*.pdf
+/Lectures/
+/Library/
+/Notes/
+
+# ── Editor and OS noise ───────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+*.swp
+.idea/
+.vscode/
+
+# ── Python, for the Anki round-trip test ──────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+venv/
