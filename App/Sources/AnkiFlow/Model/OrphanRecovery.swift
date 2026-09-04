@@ -197,8 +197,27 @@ enum OrphanRecovery {
 
     /// Renames the question file to sit beside the lecture you chose.
     static func adopt(_ orphan: Orphan, pdfURL: URL) throws {
+        let manager = FileManager.default
         let target = pdfURL.deletingPathExtension()
             .appendingPathExtension(AnkiIdentity.sidecarExtension)
-        try FileManager.default.moveItem(at: orphan.sidecarURL, to: target)
+        let source = orphan.sidecarURL.standardizedFileURL
+        let destination = target.standardizedFileURL
+        guard source != destination else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        guard orphan.candidates.contains(where: {
+            $0.pdfURL.standardizedFileURL == pdfURL.standardizedFileURL
+        }) else {
+            throw CocoaError(.fileReadNoPermission)
+        }
+        guard !manager.fileExists(atPath: target.path) else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+        try manager.moveItem(at: source, to: destination)
+        guard !manager.fileExists(atPath: source.path),
+              manager.fileExists(atPath: target.path) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        AtomicWrite.setHidden(true, at: target)
     }
 }

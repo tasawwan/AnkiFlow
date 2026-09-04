@@ -2,7 +2,7 @@
 The test that matters: export, study, edit, re-export, merge -- against a real
 Anki collection. Asserts scheduling survives and the right notes update.
 """
-import os, shutil, sys, time
+import os, re, shutil, sys, time
 from anki.collection import Collection
 from anki import import_export_pb2 as ie
 import mirror
@@ -51,6 +51,24 @@ def state(col):
                 deck=col.decks.name(c.did), cid=c.id,
                 sched=(c.type, c.queue, c.due, c.ivl, c.reps, c.lapses, c.factor))
     return out
+
+
+def cards_of(col, qid):
+    """Every card of the note with this QID, ordered by template ordinal.
+    `state()` keeps one card per note, which is fine for every kind but cloze."""
+    for nid in col.find_notes(""):
+        n = col.get_note(nid)
+        if n.fields[6] == qid:
+            return sorted(n.cards(), key=lambda c: c.ord)
+    return []
+
+
+def notetype_of(col, qid):
+    for nid in col.find_notes(""):
+        n = col.get_note(nid)
+        if n.fields[6] == qid:
+            return col.models.get(n.mid)
+    return None
 
 
 def make_questions():
@@ -270,6 +288,151 @@ def main():
     check("all-at-once makes one card from the same masks",
           s10["new"] == 1 and s10["changed"] == 0,
           f'new={s10["new"]} changed={s10["changed"]}')
+
+    # The all-at-once answer boxes every region it had covered. Without that the
+    # back is the bare slide and you are left comparing it to the front from
+    # memory to work out what you were meant to recall.
+    rects = [m["rect"] for m in occ["masks"]]
+    boxed = mirror.occlusion_media_name(plan["sha"], 20, None, [], None, rects)
+    bare = mirror.occlusion_media_name(plan["sha"], 20, None, [], None, [])
+    check("the all-at-once answer is not just the plain slide", boxed != bare,
+          f"{boxed} vs {bare}")
+    check("an unmarked page still gets the plain filename",
+          bare == mirror.media_name(plan["sha"], 20, None), bare)
+
+    # One outlined region must hash exactly as it did when `outlined` was a
+    # single rect, or every per-region card in every existing collection gets a
+    # new filename and a pointless re-export.
+    one = mirror.mask_paint_fingerprint([], None, [rects[0]])
+    legacy_parts = ["t-", "o" + mirror.crop_fingerprint(rects[0])]
+    import hashlib as _h
+    legacy = _h.sha256(",".join(legacy_parts).encode()).hexdigest()[:10]
+    check("one boxed region keeps the filename it always had", one == legacy,
+          f"{one} vs {legacy}")
+
+    import_pkg(col, f"{WORK}/v11.apkg")
+    after9 = state(col)
+    check("the all-at-once card carries the boxed answer image",
+          boxed in after9[occ["qid"]]["back_media"],
+          after9[occ["qid"]]["back_media"][:120])
+
+    print("\n=== 8. Cloze ===")
+    cloze = {
+        "qid": "01JBQZ9CLOZE000000000000AA",
+        "kind": "cloze",
+        "front": ("The {{c1::classical}} pathway is triggered by "
+                  "{{c2::antibody}} bound to antigen, and converges on "
+                  "{{c3::C3 convertase}}."),
+        "back": "Ask yourself which one is antibody-dependent.",
+        "blanks": {},
+        "questionPages": [],
+        "answerPages": [40, 41],
+        "tags": ["high-yield"],
+    }
+    questions.append(cloze)
+    s11 = mirror.export([plan], f"{WORK}/v12.apkg", export_state, media)
+    check("a cloze question is one new note", s11["new"] == 1, f'new={s11["new"]}')
+
+    import_pkg(col, f"{WORK}/v12.apkg")
+    after9 = state(col)
+    check("cloze note imported", cloze["qid"] in after9)
+
+    model = notetype_of(col, cloze["qid"])
+    check("cloze note uses the cloze note type",
+          model is not None and model["name"] == mirror.CLOZE_NAME,
+          str(model["name"]) if model else "no model")
+    check("the cloze model is type 1",
+          model is not None and model["type"] == 1,
+          str(model["type"]) if model else "?")
+    check("the standard note type is still separate and still type 0",
+          col.models.by_name(mirror.NOTETYPE_NAME)["type"] == 0)
+
+    cloze_cards = cards_of(col, cloze["qid"])
+    check("three deletions make three cards", len(cloze_cards) == 3,
+          f"{len(cloze_cards)} cards")
+    check("card ordinals are 0,1,2 -- one per {{cN::}}",
+          [c.ord for c in cloze_cards] == [0, 1, 2],
+          str([c.ord for c in cloze_cards]))
+    check("cloze markup reached Anki intact",
+          "{{c2::antibody}}" in after9[cloze["qid"]]["front"],
+          after9[cloze["qid"]]["front"][:80])
+    check("slides attached to a cloze land on the back",
+          after9[cloze["qid"]]["back_media"].count("<img") == 2,
+          after9[cloze["qid"]]["back_media"][:80])
+    check("the written explanation is on the Back field",
+          "antibody-dependent" in after9[cloze["qid"]]["back"])
+
+    # Anki renders each card itself -- this is the real proof the ordinals line
+    # up, because the question side must hide exactly one deletion.
+    # Stripped of tags: modern Anki renders a hidden deletion as
+    # <span class="cloze" data-cloze="classical">[...]</span>, so the answer is
+    # still in the raw HTML even though the reader never sees it.
+    fronts = [re.sub(r"<[^>]+>", "", c.question()) for c in cloze_cards]
+    check("each card hides a different deletion",
+          sum("classical" not in f for f in fronts) == 1
+          and sum("antibody" not in f for f in fronts) == 1
+          and sum("C3 convertase" not in f for f in fronts) == 1,
+          "a deletion is hidden on the wrong number of cards")
+
+    study(col)
+    before9 = state(col)
+    sched_before = {c.ord: (c.ivl, c.reps, c.factor) for c in cards_of(col, cloze["qid"])}
+
+    print("\n--- editing the text keeps the schedule ---")
+    time.sleep(1.1)
+    cloze["front"] = cloze["front"].replace("triggered by", "set off by")
+    s12 = mirror.export([plan], f"{WORK}/v13.apkg", export_state, media)
+    check("editing cloze text is one change", s12["changed"] == 1, f'changed={s12["changed"]}')
+    import_pkg(col, f"{WORK}/v13.apkg")
+    sched_after = {c.ord: (c.ivl, c.reps, c.factor) for c in cards_of(col, cloze["qid"])}
+    check("SCHEDULING PRESERVED on every cloze card",
+          sched_after == sched_before, f"{sched_before} -> {sched_after}")
+
+    print("\n--- adding a deletion adds a card and leaves the others alone ---")
+    time.sleep(1.1)
+    cloze["front"] += " It is regulated by {{c4::C1 inhibitor}}."
+    mirror.export([plan], f"{WORK}/v14.apkg", export_state, media)
+    import_pkg(col, f"{WORK}/v14.apkg")
+    grown = cards_of(col, cloze["qid"])
+    check("a fourth deletion makes a fourth card", len(grown) == 4, f"{len(grown)} cards")
+    check("the first three keep their scheduling",
+          {c.ord: (c.ivl, c.reps, c.factor) for c in grown if c.ord < 3} == sched_before,
+          "scheduling moved")
+    check("the new card starts unstudied",
+          [c for c in grown if c.ord == 3][0].reps == 0)
+
+    print("\n--- a repeated ordinal is one card, not two ---")
+    twin = {
+        "qid": "01JBQZ9CLOZE000000000000BB", "kind": "cloze",
+        "front": "Both {{c1::C4b}} and {{c1::C2a}} form the convertase.",
+        "back": "", "blanks": {}, "questionPages": [], "answerPages": [], "tags": [],
+    }
+    questions.append(twin)
+    mirror.export([plan], f"{WORK}/v15.apkg", export_state, media)
+    import_pkg(col, f"{WORK}/v15.apkg")
+    check("two deletions sharing c1 make a single card",
+          len(cards_of(col, twin["qid"])) == 1,
+          f'{len(cards_of(col, twin["qid"]))} cards')
+
+    print("\n--- cloze with nothing hidden never reaches Anki ---")
+    empty = {
+        "qid": "01JBQZ9CLOZE000000000000CC", "kind": "cloze",
+        "front": "I meant to hide something here but never did.",
+        "back": "", "blanks": {}, "questionPages": [], "answerPages": [], "tags": [],
+    }
+    questions.append(empty)
+    s13 = mirror.export([plan], f"{WORK}/v16.apkg", export_state, media)
+    check("a cloze with no deletions is skipped, not exported",
+          s13.get("skipped_cloze") == 1, str(s13.get("skipped_cloze")))
+    import_pkg(col, f"{WORK}/v16.apkg")
+    check("and it is nowhere in the collection", empty["qid"] not in state(col))
+
+    print("\n--- cloze and standard notes coexist ---")
+    check("both note types are in the collection",
+          col.models.by_name(mirror.NOTETYPE_NAME) is not None
+          and col.models.by_name(mirror.CLOZE_NAME) is not None)
+    check("the earlier basic note is untouched by any of this",
+          "01JBQZ4A1B2C3D4E5F6G7H8J9K" in state(col))
 
     col.close()
     print("\n" + "=" * 64)

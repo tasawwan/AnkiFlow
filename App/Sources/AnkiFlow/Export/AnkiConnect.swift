@@ -103,7 +103,7 @@ enum AnkiConnect {
         // of misplaced quoting is why deleting reported "Anki had none of them".
         // Scoped to our note type so it can only ever reach cards this app made.
         let clauses = qids.map { "QID:\"\($0)\"" }.joined(separator: " OR ")
-        let query = "\"note:\(AnkiIdentity.noteTypeName)\" (\(clauses))"
+        let query = "\(AnkiIdentity.noteTypeScope) (\(clauses))"
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"

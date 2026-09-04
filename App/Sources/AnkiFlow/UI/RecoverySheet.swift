@@ -118,6 +118,12 @@ struct RecoverySheet: View {
                     if let selected { state.adopt(orphan, pdfURL: selected) }
                 }
                 .disabled(selected == nil)
+
+                Button("Delete") {
+                    state.trashOrphan(orphan)
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
             }
 
             if orphan.candidates.isEmpty {

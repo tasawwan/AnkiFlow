@@ -10,6 +10,7 @@ enum PanelType: Hashable {
     case basic
     case slide2slide
     case occlusion
+    case cloze
     case template(String)
 
     var kind: QuestionKind {
@@ -17,6 +18,7 @@ enum PanelType: Hashable {
         case .basic:       return .basic
         case .slide2slide: return .slide2slide
         case .occlusion:   return .occlusion
+        case .cloze:       return .cloze
         case .template:    return .template
         }
     }
@@ -31,6 +33,7 @@ enum PanelType: Hashable {
         case .basic:              return question.kind == .basic
         case .slide2slide:        return question.kind == .slide2slide
         case .occlusion:          return question.kind == .occlusion
+        case .cloze:              return question.kind == .cloze
         case .template(let id):   return question.kind == .template && question.templateId == id
         }
     }
@@ -53,10 +56,10 @@ final class AppState: ObservableObject {
     @Published var anchorPage: Int = 1
     @Published var showSidebar = true
     @Published var showThumbnails = false
+    @Published var showFlaggedPagesOnly = false
     @Published var showExportSheet = false
     @Published var editingTemplate: Template?
     @Published var statusMessage: String?
-    @Published var revealBackField = false
 
     /// Editorial in light, Studio in dark, following macOS unless pinned.
     @Published var appearance: AppearanceMode = .system {
@@ -105,14 +108,36 @@ final class AppState: ObservableObject {
 
     // MARK: - Library and lectures
 
+    /// Put the library away and go back to the empty state.
+    ///
+    /// Everything on disk is left exactly as it is -- this closes a window onto
+    /// a folder, it does not touch the folder. The remembered path goes too, so
+    /// the next launch opens empty rather than reopening what you just closed.
+    func closeLibrary() {
+        closeLecture()
+        libraryObserver = nil
+        library = nil
+        undoLog = nil
+        dismissedOrphans = []
+        showRecovery = false
+        watcher?.cancel()
+        watcher = nil
+        statusMessage = nil
+        UserDefaults.standard.removeObject(forKey: "lastLibraryPath")
+    }
+
     func openLibrary(at url: URL) {
-        document?.saveNow()
+        // `closeLecture`, not a bare save-and-nil: it is what takes the markup
+        // bar down. Left up, its Done button and Esc both live inside the
+        // "a lecture is open" branch of the view and would not be on screen,
+        // while the menu item that stops editing is disabled because there is no
+        // PDF -- a mode with no way out of it.
+        closeLecture()
         let library = Library(root: url)
         self.library = library
         libraryObserver = library.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
-        self.document = nil
         self.focusedQID = nil
         UserDefaults.standard.set(url.path, forKey: "lastLibraryPath")
         undoLog = UndoLog(libraryRoot: url)
@@ -159,12 +184,18 @@ final class AppState: ObservableObject {
 
     func closeLecture() {
         document?.saveNow()
+        // Unsaved marks/crops to the PDF are discarded rather than written to disk,
+        // so the user's PDF is never modified without an explicit Save command.
+        commitPendingText()
+        stopEditingPDF(discardingChanges: true)
         document = nil
         focusedQID = nil
     }
 
     func open(lecture url: URL) {
         document?.saveNow()
+        commitPendingText()
+        stopEditingPDF(discardingChanges: true)
         let opened = LectureDocument(pdfURL: url, libraryRoot: library?.root)
         opened.hideFile = library?.settings.hideSidecarFiles ?? true
         document = opened
@@ -184,15 +215,55 @@ final class AppState: ObservableObject {
 
     func goToPage(_ page: Int) {
         guard pageCount > 0 else { return }
-        currentPage = min(max(1, page), pageCount)
+        let bounded = min(max(1, page), pageCount)
+        guard showFlaggedPagesOnly else {
+            currentPage = bounded
+            return
+        }
+        let flagged = flaggedPages
+        guard !flagged.isEmpty else { return }
+        currentPage = flagged.min { abs($0 - bounded) < abs($1 - bounded) } ?? flagged[0]
     }
 
     func nextPage() {
-        goToPage(currentPage + 1)
+        if showFlaggedPagesOnly {
+            let pages = flaggedPages
+            guard let index = pages.firstIndex(of: currentPage), !pages.isEmpty else {
+                currentPage = pages.first ?? currentPage
+                return
+            }
+            currentPage = pages[(index + 1) % pages.count]
+        } else {
+            goToPage(currentPage + 1)
+        }
     }
 
     func previousPage() {
-        goToPage(currentPage - 1)
+        if showFlaggedPagesOnly {
+            let pages = flaggedPages
+            guard let index = pages.firstIndex(of: currentPage), !pages.isEmpty else {
+                currentPage = pages.last ?? currentPage
+                return
+            }
+            currentPage = pages[(index - 1 + pages.count) % pages.count]
+        } else {
+            goToPage(currentPage - 1)
+        }
+    }
+
+    var flaggedPages: [Int] {
+        guard let pdf = document?.editableDocument else { return [] }
+        return (0..<pdf.pageCount).compactMap { index in
+            guard let page = pdf.page(at: index) else { return nil }
+            return page.annotations.contains(where: PDFEditing.isFlag) ? index + 1 : nil
+        }
+    }
+
+    func toggleFlaggedPagesOnly() {
+        showFlaggedPagesOnly.toggle()
+        if showFlaggedPagesOnly, let first = flaggedPages.first {
+            currentPage = first
+        }
     }
 
     // MARK: - Questions
@@ -213,22 +284,16 @@ final class AppState: ObservableObject {
         var question = Question(
             kind: panelType.kind,
             templateId: panelType.templateId,
-            seedPage: panelType.kind == .slide2slide ? nil : currentPage
+            seedPage: nil
         )
-        if panelType.kind == .slide2slide {
-            question.questionPages = [currentPage]
-            armedRow = .question
-        } else {
-            armedRow = .answer
-        }
-        if let template = templates.template(id: panelType.templateId),
-           template.slides == .front {
-            // A front-slides template wants the seeded page on the question row,
-            // and that row armed, or the first ⌘E goes to the wrong side.
-            question.questionPages = question.answerPages
-            question.answerPages = []
-            armedRow = .question
-        }
+        // Nothing is attached yet, and the anchor is where you are standing.
+        //
+        // A new question used to arrive already holding the current slide. That
+        // made sense when there was one slide row; with two it is actively
+        // wrong, because the flow is now type → Tab → ⌘E, and a seeded question
+        // row would leave slide 12 on the front of a card whose answer is
+        // 12–18. Attaching is an explicit act: ⌘T for this slide, ⌘E for a run.
+        armedRow = defaultArmedRow(for: question)
         if let template = templates.template(id: panelType.templateId) {
             for blank in template.blanks where question.blanks[blank.key] == nil {
                 question.blanks[blank.key] = ""
@@ -521,10 +586,20 @@ final class AppState: ObservableObject {
     @Published var findQuery = "" { didSet { runFind() } }
     @Published private(set) var findMatchCount = 0
     @Published private(set) var findIndex = 0
-    private var findMatches: [PDFSelection] = []
+    @Published private(set) var findAnnotationHighlight: (PDFPage, CGRect)?
+    private struct FindMatch {
+        let selection: PDFSelection?
+        let page: PDFPage
+        let bounds: CGRect
+    }
+    private var findMatches: [FindMatch] = []
 
     func openFind() {
-        findVisible = true
+        if findVisible {
+            closeFind()
+        } else {
+            findVisible = true
+        }
     }
 
     func closeFind() {
@@ -532,6 +607,7 @@ final class AppState: ObservableObject {
         findMatches = []
         findMatchCount = 0
         findIndex = 0
+        findAnnotationHighlight = nil
         pdfBox.view.setCurrentSelection(nil, animate: false)
     }
 
@@ -544,10 +620,31 @@ final class AppState: ObservableObject {
             findMatches = []
             findMatchCount = 0
             findIndex = 0
+            findAnnotationHighlight = nil
             pdfBox.view.setCurrentSelection(nil, animate: false)
             return
         }
-        findMatches = document.findString(query, withOptions: [.caseInsensitive])
+        findMatches = document.findString(query, withOptions: [.caseInsensitive]).compactMap { selection in
+            guard let page = selection.pages.first else { return nil }
+            return FindMatch(selection: selection, page: page, bounds: selection.bounds(for: page))
+        }
+        for pageIndex in 0..<document.pageCount {
+            guard let page = document.page(at: pageIndex) else { continue }
+            for annotation in page.annotations {
+                guard PDFEditing.kind(of: annotation) == "FreeText" else { continue }
+                guard let contents = annotation.contents,
+                      contents.range(of: query, options: [.caseInsensitive]) != nil else { continue }
+                // PDFKit's document search does not include FreeText
+                // annotations. Build a page selection for the annotation's
+                // bounds so the find result gets the same visible highlight
+                // and navigation behavior as native slide text.
+                findMatches.append(FindMatch(
+                    selection: nil,
+                    page: page,
+                    bounds: annotation.bounds
+                ))
+            }
+        }
         findMatchCount = findMatches.count
         findIndex = 0
         showFindMatch()
@@ -564,14 +661,19 @@ final class AppState: ObservableObject {
     private func showFindMatch() {
         guard findMatches.indices.contains(findIndex),
               let document = pdfBox.view.document else { return }
-        let selection = findMatches[findIndex]
-        selection.color = .systemYellow
-        pdfBox.view.setCurrentSelection(selection, animate: true)
-        pdfBox.view.go(to: selection)
-        if let page = selection.pages.first {
-            let number = document.index(for: page) + 1
-            if number != currentPage { currentPage = number }
+        let match = findMatches[findIndex]
+        if let selection = match.selection {
+            findAnnotationHighlight = nil
+            selection.color = .systemYellow
+            pdfBox.view.setCurrentSelection(selection, animate: true)
+            pdfBox.view.go(to: selection)
+        } else {
+            pdfBox.view.setCurrentSelection(nil, animate: false)
+            findAnnotationHighlight = (match.page, match.bounds)
+            pdfBox.view.go(to: match.bounds, on: match.page)
         }
+        let number = document.index(for: match.page) + 1
+        if number != currentPage { currentPage = number }
     }
 
     /// Which slide row ⌘E and ⌘T should act on for a given question.
@@ -581,26 +683,40 @@ final class AppState: ObservableObject {
     /// were looking at before. Click a Slide2Slide question, arm its question
     /// row, then click a Basic question, and ⌘E wrote into `questionPages` --
     /// which a Basic card neither shows nor exports.
+    /// Occlusion and cloze have no question-slides row, so their slides can only
+    /// be answer slides. Everything else opens with the caret in the question
+    /// field, and the armed row follows the caret from there.
     func defaultArmedRow(for question: Question) -> ArmedRow {
         switch question.kind {
-        case .slide2slide:
+        case .occlusion, .cloze:
+            return .answer
+        case .basic, .slide2slide:
             return .question
         case .template:
-            return templates.template(id: question.templateId)?.slides == .front ? .question : .answer
-        case .basic, .occlusion:
-            return .answer
+            return templates.template(id: question.templateId)?.slides == .back ? .answer : .question
         }
+    }
+
+    /// Where a range should start from, given which row is armed.
+    ///
+    /// It has to follow the armed row: reading it from `answerPages` while the
+    /// *question* row is armed -- which is what Slide2Slide and a front-slides
+    /// template do -- anchors one row on the other's slides, and the first ⌘E
+    /// rewrites the row from a page that was never in it.
+    func anchor(for question: Question, row: ArmedRow) -> Int {
+        let pages = row == .question ? question.questionPages : question.answerPages
+        return pages.first ?? currentPage
     }
 
     /// True when the panel shows both slide rows for this question, and the
     /// armed one therefore needs marking.
     func showsBothRows(_ question: Question) -> Bool {
         switch question.kind {
-        case .slide2slide:
+        case .basic, .slide2slide:
             return true
         case .template:
             return templates.template(id: question.templateId)?.slides == .both
-        case .basic, .occlusion:
+        case .occlusion, .cloze:
             return false
         }
     }
@@ -612,10 +728,16 @@ final class AppState: ObservableObject {
     /// The questions as they were when the current action started.
     private var pendingBefore: (label: String, lecture: URL, questions: [Question])?
 
-    var canUndo: Bool { textUndoAvailable || undoLog?.undoLabel != nil }
-    var canRedo: Bool { undoLog?.redoLabel != nil }
-    var undoLabel: String? { undoLog?.undoLabel }
-    var redoLabel: String? { undoLog?.redoLabel }
+    var canUndo: Bool {
+        if isEditingPDF { return editSession?.canUndo == true }
+        return textUndoAvailable || undoLog?.undoLabel != nil
+    }
+    var canRedo: Bool {
+        if isEditingPDF { return editSession?.canRedo == true }
+        return undoLog?.redoLabel != nil
+    }
+    var undoLabel: String? { isEditingPDF ? editSession?.undoLabel : undoLog?.undoLabel }
+    var redoLabel: String? { isEditingPDF ? editSession?.redoLabel : undoLog?.redoLabel }
 
     /// Called before something changes the questions. The matching `commit` is
     /// what actually records it, so an action that turns out to change nothing
@@ -646,6 +768,17 @@ final class AppState: ObservableObject {
     }
 
     func undo() {
+        // While the markup bar is up ⌘U belongs to the marks. The question undo
+        // log is untouched by anything you draw on a slide, so the two stacks
+        // never need to interleave.
+        if isEditingPDF {
+            commitPendingText()
+            let label = editSession?.undoLabel
+            editSession?.undo()
+            repaintPDF()
+            if let label { statusMessage = "Undid \(label)." }
+            return
+        }
         if let responder = NSApp.keyWindow?.firstResponder as? NSText,
            let manager = responder.undoManager, manager.canUndo {
             manager.undo()
@@ -661,6 +794,14 @@ final class AppState: ObservableObject {
     }
 
     func redo() {
+        if isEditingPDF {
+            commitPendingText()
+            let label = editSession?.redoLabel
+            editSession?.redo()
+            repaintPDF()
+            if let label { statusMessage = "Redid \(label)." }
+            return
+        }
         guard let (step, lecture) = undoLog?.popRedo() else { return }
         if let trashed = step.trashed {
             // Trashing again puts the files somewhere new, so the step has to
@@ -744,6 +885,15 @@ final class AppState: ObservableObject {
 
     func dismissOrphan(_ orphan: OrphanRecovery.Orphan) {
         dismissedOrphans.insert(orphan.id)
+    }
+
+    func trashOrphan(_ orphan: OrphanRecovery.Orphan) {
+        guard let library, library.trashOrphan(orphan) else {
+            statusMessage = "Could not move \(orphan.oldName) to the Trash."
+            return
+        }
+        dismissedOrphans.remove(orphan.id)
+        statusMessage = "\(orphan.oldName) moved to the Trash."
     }
 
     // MARK: - Preview
@@ -996,6 +1146,7 @@ final class AppState: ObservableObject {
         case .basic:       return .basic
         case .slide2slide: return .slide2slide
         case .occlusion:   return .occlusion
+        case .cloze:       return .cloze
         case .template:    return question.templateId.map { PanelType.template($0) } ?? .basic
         }
     }
@@ -1121,15 +1272,560 @@ final class AppState: ObservableObject {
         crop(forPage: currentPage) != nil
     }
 
-    func cyclePanelType() {
-        var order: [PanelType] = [.basic, .slide2slide, .occlusion]
-        order.append(contentsOf: templates.templates.map { PanelType.template($0.id) })
-        guard let index = order.firstIndex(of: panelType) else {
-            panelType = .basic
+    // MARK: - Editing the PDF
+
+    /// Whether the markup bar is up.
+    ///
+    /// Separate from `editTool`, and the separation matters: editing with the
+    /// text-select tool in hand still selects text normally, which is what
+    /// Highlight, Underline and Strikethrough need -- they act on a selection
+    /// you have already made.
+    @Published private(set) var isEditingPDF = false
+    /// Live while editing: the pending marks, the undo stack, and whether any
+    /// of it still needs saving. Nothing here reaches the file until you save.
+    @Published private(set) var editSession: PDFEditSession?
+    @Published var editTool: PDFEditing.Tool = .select {
+        didSet {
+            guard oldValue != editTool else { return }
+            pdfBox.view.setCurrentSelection(nil, animate: false)
+        }
+    }
+    @Published var editStroke: InkColour = .amber
+    /// nil means "no fill" -- the outline only, which is what you want over a
+    /// diagram nine times out of ten.
+    @Published var editFill: InkColour?
+    @Published var editLineWidth: Double = 2
+    @Published var editFontSize: Double = 14
+    @Published var editBold = false
+    @Published var editItalic = false
+    @Published var editUnderline = false
+    @Published var showingStylePicker = false
+    /// Raised when you try to leave editing with marks that were never saved.
+    @Published var confirmingDiscardEdits = false
+    /// Page deletion is the one edit that cannot be undone by doing the
+    /// opposite, so it is the one that asks.
+    @Published var confirmingPageDelete = false
+
+    /// The four ink colours. Kept short on purpose: a colour well would let you
+    /// pick something invisible on a white slide, and the point of marking a
+    /// slide is that the mark is obvious.
+    enum InkColour: String, CaseIterable, Identifiable {
+        case amber, red, blue, green
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .amber: return "Amber"
+            case .red:   return "Red"
+            case .blue:  return "Blue"
+            case .green: return "Green"
+            }
+        }
+
+        var nsColor: NSColor {
+            switch self {
+            case .amber: return NSColor(red: 0.878, green: 0.627, blue: 0.227, alpha: 1)
+            case .red:   return NSColor(red: 0.710, green: 0.329, blue: 0.369, alpha: 1)
+            case .blue:  return NSColor(red: 0.294, green: 0.478, blue: 0.749, alpha: 1)
+            case .green: return NSColor(red: 0.243, green: 0.612, blue: 0.427, alpha: 1)
+            }
+        }
+
+        var color: Color { Color(nsColor: nsColor) }
+    }
+
+    var canEditPDF: Bool { document?.editableDocument != nil }
+    var hasUnsavedPDFEdits: Bool { editSession?.hasUnsavedChanges == true }
+
+    private var editSessionObserver: AnyCancellable?
+    private var pendingPageRemap: [Int: Int] = [:]
+
+    func startEditingPDF() {
+        guard let lecture = document, let pdf = lecture.editableDocument else { return }
+        let session = PDFEditSession(document: pdf, url: lecture.pdfURL)
+        // Forwarded, or nothing driven by the session redraws: the Save button
+        // would not appear on the first mark, ⌘S would stay disabled, and the
+        // Undo menu would keep the title it had when editing began.
+        editSessionObserver = session.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+        editSession = session
+        pendingPageRemap = [:]
+        editTool = .select
+        isEditingPDF = true
+    }
+
+    /// Leave editing. Refuses while there are unsaved marks -- it raises the
+    /// confirmation instead, because silently throwing away a page of markup is
+    /// the one thing this feature must never do.
+    /// Push whatever is being typed into a text box onto the undo stack.
+    ///
+    /// A menu key equivalent does not move first responder, so ⌘S with the caret
+    /// still in a note would write the annotation with its old (usually empty)
+    /// contents. Resigning first responder ends the field's editing session,
+    /// which is what commits it.
+    /// Force the slide back onto the screen after the document changed under it.
+    ///
+    /// `layoutDocumentView` alone rebuilds the layout but does not always redraw
+    /// a page whose annotations changed, which is what made undo look like it
+    /// had done nothing at all.
+    func repaintPDF() {
+        let view = pdfBox.view
+        view.layoutDocumentView()
+        view.setNeedsDisplay(view.bounds)
+        if let docView = view.documentView {
+            docView.setNeedsDisplay(docView.bounds)
+            func invalidateRecursively(_ v: NSView) {
+                v.needsDisplay = true
+                v.layer?.setNeedsDisplay()
+                for sub in v.subviews {
+                    invalidateRecursively(sub)
+                }
+            }
+            invalidateRecursively(docView)
+        }
+    }
+
+    /// Picks up a text mark instrument (highlight, underline, strikethrough).
+    /// If text is currently selected in the PDF view, the mark is applied immediately to it.
+    func applyTextMarkTool(_ tool: PDFEditing.Tool) {
+        guard let mark = tool.textMark else {
+            editTool = editTool == tool ? .select : tool
             return
         }
-        panelType = order[(index + 1) % order.count]
+        // Capture the native selection before changing tools; editTool's
+        // didSet clears it so a new tool cannot leave stale text selected.
+        let selectedText = pdfBox.view.currentSelection
+        editTool = tool
+        if let selection = selectedText,
+           let session = editSession {
+            let made = PDFEditing.marks(for: selection, kind: mark, colour: editStroke.nsColor)
+            if !made.isEmpty {
+                session.perform("that \(mark.label.lowercased())",
+                                undo: {
+                                    for (annotation, page) in made {
+                                        annotation.shouldDisplay = false
+                                        page.removeAnnotation(annotation)
+                                    }
+                                },
+                                redo: {
+                                    for (annotation, page) in made {
+                                        annotation.shouldDisplay = true
+                                        page.addAnnotation(annotation)
+                                    }
+                                })
+                pdfBox.view.setCurrentSelection(nil, animate: false)
+                repaintPDF()
+            }
+        }
+    }
+
+    private func commitPendingText() {
+        guard isEditingPDF else { return }
+        pdfBox.view.window?.makeFirstResponder(pdfBox.view)
+    }
+
+    func stopEditingPDF(discardingChanges: Bool = false) {
+        commitPendingText()
+        if hasUnsavedPDFEdits && !discardingChanges {
+            confirmingDiscardEdits = true
+            return
+        }
+        if discardingChanges {
+            editSession?.revertAll()
+            pendingPageRemap = [:]
+            pdfBox.view.layoutDocumentView()
+        }
+        confirmingDiscardEdits = false
+        editSessionObserver = nil
+        editSession = nil
+        isEditingPDF = false
+        showingStylePicker = false
+        pdfBox.view.setCurrentSelection(nil, animate: false)
+    }
+
+    /// ⌘S. Writes the marks into the PDF and refreshes the fingerprint, so the
+    /// slides re-render and the affected cards update on the next export.
+    @discardableResult
+    func savePDFEdits() -> Bool {
+        commitPendingText()
+        guard let lecture = document, let session = editSession else { return false }
+        do {
+            try lecture.applyPDFEdit(PDFEditing.Change(remap: pendingPageRemap,
+                                                       boxChanges: session.boxChanges(),
+                                                       label: "your markup"))
+            session.markSaved()
+            pendingPageRemap = [:]
+            statusMessage = "Saved your markup into \(lecture.pdfURL.lastPathComponent)."
+            return true
+        } catch {
+            statusMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    // MARK: Marks
+
+    /// Put a one-shot tool down once it has been used.
+    ///
+    /// Drawing a shape and then wanting to nudge it is the common next move, so
+    /// the tool returns to Select rather than making you go and find a pointer.
+    /// The text marks and Select itself stay in your hand -- you highlight three
+    /// things in a row far more often than one.
+    func toolWasUsed() {
+        if editTool.isOneShot { editTool = .select }
+    }
+
+    /// Undo and redo, aimed at whichever stack is in play. The markup bar has
+    /// its own buttons for these as well as the Edit menu, because in a mode
+    /// with its own toolbar you look at the toolbar.
+    func undoEdit() { undo() }
+    func redoEdit() { redo() }
+
+    /// Recolor whatever is selected, or set the color for the next mark.
+    func setEditStroke(_ colour: InkColour) {
+        commitActiveTextBox()
+        editStroke = colour
+        if let session = editSession, let selection = session.selection {
+            session.setColour(colour.nsColor, on: selection.annotation)
+            repaintPDF()
+        }
+    }
+
+    func setEditFill(_ fill: InkColour?) {
+        commitActiveTextBox()
+        editFill = fill
+        if let session = editSession, let selection = session.selection {
+            session.setFill(fill?.nsColor, on: selection.annotation)
+            repaintPDF()
+        }
+    }
+
+    func setEditLineWidth(_ width: Double) {
+        editLineWidth = width
+        guard let session = editSession, let selection = session.selection,
+              PDFEditing.kind(of: selection.annotation) != "FreeText" else { return }
+        session.setLineWidth(CGFloat(width), on: selection.annotation)
+        repaintPDF()
+    }
+
+    func setEditFontSize(_ size: Double) {
+        commitActiveTextBox()
+        editFontSize = size
+        applySelectedTextFont()
+    }
+
+    func toggleEditBold() {
+        editBold.toggle()
+        if !pdfBox.toggleFontTrait(.boldFontMask) { applySelectedTextFont() }
+    }
+
+    func toggleEditItalic() {
+        editItalic.toggle()
+        if !pdfBox.toggleFontTrait(.italicFontMask) { applySelectedTextFont() }
+    }
+
+    func toggleEditUnderline() {
+        if pdfBox.toggleUnderline() { return }
+        editUnderline.toggle()
+        guard let session = editSession, let selection = session.selection,
+              PDFEditing.kind(of: selection.annotation) == "FreeText" else { return }
+        let text = PDFEditing.richText(for: selection.annotation)
+            ?? NSAttributedString(string: selection.annotation.contents ?? "",
+                                   attributes: [.font: selection.annotation.font ?? NSFont.systemFont(ofSize: editFontSize),
+                                                .foregroundColor: selection.annotation.fontColor ?? editStroke.nsColor])
+        let updated = NSMutableAttributedString(attributedString: text)
+        updated.addAttribute(.underlineStyle,
+                             value: editUnderline ? NSUnderlineStyle.single.rawValue : 0,
+                             range: NSRange(location: 0, length: updated.length))
+        session.setAttributedString(updated, on: selection.annotation)
+        repaintPDF()
+    }
+
+    private func commitActiveTextBox() {
+        guard isEditingPDF else { return }
+        pdfBox.view.window?.makeFirstResponder(pdfBox.view)
+    }
+
+    private func applySelectedTextFont() {
+        guard let session = editSession, let selection = session.selection,
+              PDFEditing.kind(of: selection.annotation) == "FreeText" else { return }
+        session.setFontSize(CGFloat(editFontSize), on: selection.annotation)
+        repaintPDF()
+    }
+
+    func deleteSelectedMark() {
+        guard let session = editSession, let selection = session.selection else { return }
+        session.remove(selection.annotation, from: selection.page)
+        repaintPDF()
+    }
+
+    var currentPageIsFlagged: Bool {
+        document?.editableDocument?.page(at: currentPage - 1)?.annotations.contains(where: PDFEditing.isFlag) == true
+    }
+
+    func togglePageFlag() {
+        if !isEditingPDF { startEditingPDF() }
+        guard let session = editSession,
+              let page = session.document.page(at: currentPage - 1) else { return }
+        if let marker = page.annotations.first(where: PDFEditing.isFlag) {
+            session.perform("unflagging page \(currentPage)",
+                            undo: {
+                                marker.shouldDisplay = true
+                                page.addAnnotation(marker)
+                            },
+                            redo: {
+                                marker.shouldDisplay = false
+                                page.removeAnnotation(marker)
+                            })
+            statusMessage = "Unflagged page \(currentPage)."
+        } else {
+            let marker = PDFEditing.flag(on: page)
+            session.perform("flagging page \(currentPage)",
+                            undo: {
+                                marker.shouldDisplay = false
+                                page.removeAnnotation(marker)
+                            },
+                            redo: {
+                                marker.shouldDisplay = true
+                                page.addAnnotation(marker)
+                            })
+            statusMessage = "Flagged page \(currentPage)."
+        }
+        repaintPDF()
+    }
+
+    // MARK: Undo, while editing
+
+    var pdfUndoAvailable: Bool { isEditingPDF && editSession?.canUndo == true }
+    var pdfRedoAvailable: Bool { isEditingPDF && editSession?.canRedo == true }
+
+    // MARK: Pages
+
+    /// Page operations write to the file straight away rather than waiting for
+    /// ⌘S. They are not marks: deleting or reordering slides has to renumber
+    /// every question that points at them, and that is a change to the question
+    /// files as much as to the PDF. Batching it behind a save would mean holding
+    /// two documents' worth of pending state in step.
+    /// Called *before* a page operation touches the document.
+    ///
+    /// A page operation writes the live document, and the live document carries
+    /// any pending marks with it -- so they are committed deliberately rather
+    /// than smuggled out. This has to run first: bailing afterwards would leave
+    /// the page already rotated or deleted in memory, nothing on disk, and the
+    /// questions un-renumbered.
+    private func readyForPageEdit() -> Bool {
+        guard editSession?.hasUnsavedChanges == true else { return true }
+        return savePDFEdits()
+    }
+
+    private func applyPageEdit(_ change: PDFEditing.Change) {
+        guard let lecture = document else { return }
+        do {
+            try lecture.applyPDFEdit(change)
+            pdfBox.view.layoutDocumentView()
+            if currentPage > lecture.pageCount { currentPage = max(1, lecture.pageCount) }
+            statusMessage = summary(of: change)
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+        // Renumbering reloads the PDF from disk, which leaves every closure on
+        // the undo stack pointing at pages of a document nobody can see any
+        // more. The session is rebuilt against the new one, keeping the tool in
+        // your hand -- and if the reload failed there is nothing to edit, so
+        // editing ends rather than carrying on against a document that is gone.
+        if isEditingPDF {
+            let tool = editTool
+            editSessionObserver = nil
+            editSession = nil
+            startEditingPDF()
+            if editSession == nil {
+                stopEditingPDF(discardingChanges: true)
+                statusMessage = "Could not reopen \(lecture.pdfURL.lastPathComponent) after that change."
+            } else {
+                editTool = tool
+            }
+        }
+    }
+
+    private func summary(of change: PDFEditing.Change) -> String {
+        let base = "Saved \(change.label) into \(document?.pdfURL.lastPathComponent ?? "the PDF")."
+        guard change.touchesNumbering else { return base }
+        return base + " Slide numbers in your questions followed it."
+    }
+
+    func rotateCurrentPage(by degrees: Int) {
+        guard let pdf = document?.editableDocument, readyForPageEdit() else { return }
+        applyPageEdit(PDFEditing.rotate(pages: [currentPage], by: degrees, in: pdf))
+    }
+
+    func deleteCurrentPage() {
+        guard let pdf = document?.editableDocument, readyForPageEdit() else { return }
+        do {
+            applyPageEdit(try PDFEditing.delete(pages: [currentPage], in: pdf))
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+        confirmingPageDelete = false
+    }
+
+    func moveCurrentPage(to destination: Int) {
+        guard let pdf = document?.editableDocument, readyForPageEdit() else { return }
+        applyPageEdit(PDFEditing.move(page: currentPage, to: destination, in: pdf))
+        currentPage = min(max(destination, 1), pdf.pageCount)
+    }
+
+    func movePage(from source: Int, to destination: Int) {
+        guard source != destination, let pdf = document?.editableDocument else {
+            currentPage = source
+            return
+        }
+        if !isEditingPDF { startEditingPDF() }
+        guard let session = editSession else { return }
+        let change = PDFEditing.move(page: source, to: destination, in: pdf)
+        let count = pdf.pageCount
+        let oldRemap = pendingPageRemap
+        pendingPageRemap = oldRemap.reduce(into: [:]) { result, entry in
+            result[entry.key] = change.remap[entry.value] ?? entry.value
+        }
+        for entry in change.remap where oldRemap[entry.key] == nil {
+            pendingPageRemap[entry.key] = entry.value
+        }
+        session.record("moving that slide",
+                        undo: { [weak self] in
+                            guard let self, let pdf = self.document?.editableDocument else { return }
+                            _ = PDFEditing.move(page: destination, to: source, in: pdf)
+                            self.pdfBox.view.layoutDocumentView()
+                        },
+                        redo: { [weak self] in
+                            guard let self, let pdf = self.document?.editableDocument else { return }
+                            _ = PDFEditing.move(page: source, to: destination, in: pdf)
+                            self.pdfBox.view.layoutDocumentView()
+                        })
+        currentPage = min(max(destination, 1), count)
+        pdfBox.view.layoutDocumentView()
+        statusMessage = "Slide moved. Save to write the new order into the PDF."
+    }
+
+    func insertPages(from url: URL) {
+        guard let pdf = document?.editableDocument, readyForPageEdit() else { return }
+        do {
+            applyPageEdit(try PDFEditing.insert(contentsOf: url, at: currentPage + 1, in: pdf))
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+
+
+    /// Give every slide the crop box this one has. The common case by a mile:
+    /// a deck exported with the same margin on all sixty slides, trimmed once.
+    ///
+    /// The box is copied as a fraction of each page's *media* box rather than in
+    /// points, so it lands in the same visual place on a slide of a different
+    /// size -- a title page in another aspect ratio, say.
+    func trimAllSlidesLikeThisOne() {
+        guard let pdf = document?.editableDocument, let session = editSession,
+              let page = pdf.page(at: currentPage - 1) else { return }
+        let media = page.bounds(for: .mediaBox)
+        guard media.width > 0, media.height > 0 else { return }
+        let box = page.bounds(for: .cropBox)
+        // Copying an untrimmed slide's box would *expand* every slide that has
+        // already been trimmed back out to its full page -- the opposite of what
+        // anyone reaching for this means.
+        guard !CropRect(rect: box, in: media).isFullPage else {
+            statusMessage = "Trim this slide first, then this copies its margins to the rest."
+            return
+        }
+        let wantedFraction = CropRect(rect: box, in: media)
+
+        // One undo step for the whole lecture: it was one command.
+        var undos: [() -> Void] = []
+        var redos: [() -> Void] = []
+        for number in 1...pdf.pageCount where number != currentPage {
+            guard let other = pdf.page(at: number - 1) else { continue }
+            let otherMedia = other.bounds(for: .mediaBox)
+            // The old box has to be read before it is replaced -- it is what the
+            // crops and masks on that slide are expressed against.
+            let old = other.bounds(for: .cropBox)
+            let wanted = wantedFraction.rect(in: otherMedia).intersection(otherMedia)
+            guard wanted.width > 1, wanted.height > 1, wanted != old else { continue }
+            undos.append { other.setBounds(old, for: .cropBox) }
+            redos.append { other.setBounds(wanted, for: .cropBox) }
+        }
+        guard !redos.isEmpty else {
+            statusMessage = "Every slide already has this one's margins."
+            return
+        }
+        session.perform("trimming every slide",
+                        undo: { for step in undos { step() } },
+                        redo: { for step in redos { step() } })
+        pdfBox.view.layoutDocumentView()
+    }
+
+    // MARK: - Cloze
+    // MARK: - Cloze
+
+    /// Wrap a range of the focused cloze question's text in `{{cN::…}}`.
+    ///
+    /// `newCard` decides the ordinal: a new one makes this deletion its own
+    /// card, reusing the highest existing one blanks it at the same time as the
+    /// previous deletion. Returns false when the range is already inside a
+    /// deletion -- nesting, which this app does not produce.
+    @discardableResult
+    func hideCloze(range: Range<String.Index>, newCard: Bool) -> Bool {
+        guard let question = focusedQuestion, question.kind == .cloze else { return false }
+        let ordinal = newCard
+            ? Cloze.nextOrdinal(in: question.front)
+            : max(1, question.clozeOrdinals.max() ?? 1)
+        guard let updated = Cloze.wrap(question.front, range: range, ordinal: ordinal) else {
+            return false
+        }
+        snapshot(newCard ? "hiding that" : "adding that to the card")
+        mutateFocused { $0.front = updated }
+        return true
+    }
+
+    func cyclePanelType() {
+        var order: [PanelType] = [.basic, .slide2slide, .occlusion, .cloze]
+        order.append(contentsOf: templates.templates.map { PanelType.template($0.id) })
+        guard let index = order.firstIndex(of: panelType) else {
+            show(.basic)
+            return
+        }
+        show(order[(index + 1) % order.count])
+    }
+
+    /// Switch the panel to a card type and leave it ready to use.
+    ///
+    /// "Ready" means the slide row is already armed, so ⌘E and ⌘T land on the
+    /// right side of the card the moment you arrive. Setting `panelType` on its
+    /// own left `armedRow` holding whatever the *previous* type wanted -- arrive
+    /// at Occlusion from Slide2Slide and the question row was still armed, so
+    /// the first ⌘T went to a row that kind of card does not even show, and you
+    /// had to click a row to fix it.
+    func show(_ type: PanelType) {
+        panelType = type
         focusedQID = visibleQuestions.last?.qid
+        if let question = focusedQuestion {
+            // The panel re-derives this from the focused field a moment later;
+            // this is the value it starts from, and the one that stands when the
+            // caret never lands anywhere (a template with no blanks, say).
+            armedRow = defaultArmedRow(for: question)
+            // The slide you are looking at, not the question's first slide.
+            // Switching tabs is "make one of these about *this*"; jumping the
+            // page away from what you were reading would be the opposite.
+            anchorPage = currentPage
+        } else {
+            // Nothing here yet. Arm the row this kind of card would use, so the
+            // first ⌘E or ⌘T creates a question and fills the right row.
+            armedRow = (type.kind == .occlusion || type.kind == .cloze) ? .answer : .question
+            if let template = templates.template(id: type.templateId), template.slides == .back {
+                armedRow = .answer
+            }
+            anchorPage = currentPage
+        }
     }
 
     /// The page ⌘E would take if you pressed it now.
@@ -1150,7 +1846,8 @@ final class AppState: ObservableObject {
         var out: [(String, Int, PanelType)] = [
             ("Basic", questions.filter { $0.kind == .basic }.count, .basic),
             ("Slide2Slide", questions.filter { $0.kind == .slide2slide }.count, .slide2slide),
-            ("Occlusion", questions.filter { $0.kind == .occlusion }.count, .occlusion)
+            ("Occlusion", questions.filter { $0.kind == .occlusion }.count, .occlusion),
+            ("Cloze", questions.filter { $0.kind == .cloze }.count, .cloze)
         ]
         for template in templates.templates {
             let count = questions.filter { $0.kind == .template && $0.templateId == template.id }.count

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The right-hand panel. One card type at a time -- the dropdown governs the
 /// whole panel, so a Basic question and a Slide2Slide are never in the same
@@ -52,8 +53,10 @@ struct QuestionPanel: View {
                 ForEach(Array(state.counts().enumerated()), id: \.offset) { _, entry in
                     let isCurrent = entry.type == state.panelType
                     Button {
-                        state.panelType = entry.type
-                        state.focusedQID = state.visibleQuestions.last?.qid
+                        // `show`, not a bare assignment: it arms the slide row
+                        // this kind of card uses, so ⌘E and ⌘T work the moment
+                        // you land on the tab.
+                        state.show(entry.type)
                     } label: {
                         HStack(spacing: 6) {
                             Text(entry.label)
@@ -137,13 +140,16 @@ struct QuestionCard: View {
     @Environment(\.palette) private var palette
     let qid: String
 
-    @FocusState private var textFocused: Bool
+    /// Which text field has the caret. Tab moves between them, and the armed
+    /// slide row follows — so ⌘E, ⌘T and ⌘R always act on the side you are
+    /// writing, with nothing to click and no mode to remember.
+    enum Field: Hashable { case question, answer }
+    @FocusState private var focusedField: Field?
 
     private var question: Question? { state.document?.question(qid: qid) }
     private var isFocused: Bool { state.focusedQID == qid }
     private var template: Template? { state.templates.template(id: question?.templateId) }
     private var pageCount: Int { state.pageCount }
-    private var showBack: Bool { state.revealBackField }
 
     var body: some View {
         Group {
@@ -174,26 +180,42 @@ struct QuestionCard: View {
             }
         }
         .onChange(of: state.focusedQID) { _, newValue in
-            if newValue == qid { textFocused = true }
+            if newValue == qid { focusedField = .question }
+        }
+        // The armed row follows the caret. This is the whole interaction: Tab to
+        // the answer, ⌘E, and the slides land on the answer side.
+        .onChange(of: focusedField) { _, field in
+            guard state.focusedQID == qid, let field,
+                  let question = state.document?.question(qid: qid) else { return }
+            // Only a card that draws both rows lets the caret choose between
+            // them. An occlusion or cloze card has one slide row whatever field
+            // you are typing in, and arming the other would send ⌘E to a row the
+            // panel never shows and the exporter never reads.
+            state.armedRow = (field == .question && state.showsBothRows(question))
+                ? .question
+                : state.defaultArmedRow(for: question)
+            state.anchorPage = state.anchor(for: question, row: state.armedRow)
         }
         // ⌘⏎. Giving up focus is what pushes a SwiftUI text field's pending
         // edit into the binding; AppState then saves and clears the focused
         // question, which collapses this card.
         .onChange(of: state.commitSignal) { _, _ in
-            if state.focusedQID == qid { textFocused = false }
+            if state.focusedQID == qid { focusedField = nil }
         }
     }
 
     private func focus(_ question: Question) {
         state.focusedQID = qid
+        // Only a starting value: `focusedField`'s onChange re-derives both the
+        // moment the caret lands, and it is the one that has the last word.
         state.armedRow = state.defaultArmedRow(for: question)
-        state.anchorPage = question.answerPages.first ?? state.currentPage
+        state.anchorPage = state.anchor(for: question, row: state.armedRow)
         // Go to the slide this question is about. Clicking a question is saying
         // "I want to work on this one", and working on it means looking at it --
         // otherwise the first ⌘E or ⌘T lands on whatever slide you happened to
         // have been reading.
         if let first = question.allPages.first { state.currentPage = first }
-        textFocused = true
+        focusedField = .question
     }
 
     // MARK: Live bindings
@@ -264,46 +286,48 @@ struct QuestionCard: View {
 
     // MARK: Editor
 
+    /// The four fields every card has, in the order you fill them: what you are
+    /// asking, the slides that go with the question, the answer in words, the
+    /// slides that answer it.
+    ///
+    /// All four are optional and all four are always on screen. They used to
+    /// appear and disappear per card type, with a ⌘B to reveal the written
+    /// answer, and the cost of that was having to remember which fields this
+    /// kind of card had before you could start typing. One shape, always, is
+    /// worth more than the few pixels it spends.
     @ViewBuilder
     private func editor(_ question: Question) -> some View {
         switch question.kind {
-        case .basic:
+        case .basic, .slide2slide:
             questionText(placeholder: "Ask the big question…")
-            answerRow(question)
-        case .slide2slide:
-            questionText(placeholder: "Optional — ask something specific about these slides…")
             questionRow(question)
+            backField
             answerRow(question)
         case .occlusion:
+            // No question-slides row: an occlusion card's image *is* the answer
+            // slide, and a second row would be a place to put a slide that the
+            // card has nowhere to show.
             questionText(placeholder: "Optional — a prompt above the image…")
+            backField
             answerRow(question)
             occlusionEditor(question)
+        case .cloze:
+            clozeEditor(question)
+            backField
+            answerRow(question)
         case .template:
             templateFields
-            // Which rows appear is the template's choice, made once when the
-            // template is written rather than on every question built from it.
+            // Which slide rows appear is the template's choice, made once when
+            // the template is written rather than on every question built from
+            // it. The two text fields are always both there.
             let sides = state.templates.template(id: question.templateId)?.slides ?? .back
             if sides.showsFront { questionRow(question) }
+            backField
             if sides.showsBack { answerRow(question) }
         }
 
-        backField
-
         HStack(spacing: 12) {
             Spacer()
-            Button {
-                state.revealBackField.toggle()
-            } label: {
-                Text(showBack ? "Hide written answer" : "Add written answer")
-                    .font(.system(size: 11.5))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(palette.dim)
-
-            Text("⌘B")
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(palette.dim.opacity(0.7))
-
             Button {
                 state.focusedQID = qid
                 state.deleteFocusedQuestion()
@@ -325,29 +349,104 @@ struct QuestionCard: View {
             .font(AppFont.question(15))
             .foregroundStyle(palette.ink)
             .lineLimit(2...10)
-            .focused($textFocused)
+            .focused($focusedField, equals: .question)
     }
 
-    @ViewBuilder
+    /// The written answer. Always present, always optional — Tab from the
+    /// question lands here, and arming the answer slide row is a side effect of
+    /// being here rather than something else to press.
     private var backField: some View {
-        if showBack || !(question?.back.isEmpty ?? true) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("WRITTEN ANSWER")
-                    .font(AppFont.rowLabel)
-                    .tracking(0.6)
-                    .foregroundStyle(palette.dim)
-                TextField("Optional — the slides are usually the answer",
-                          text: bind(\.back, default: ""), axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(AppFont.question(13.5))
-                    .foregroundStyle(palette.ink)
-                    .lineLimit(2...8)
-                    .padding(8)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 7).stroke(palette.line, lineWidth: 1)
-                    )
+        VStack(alignment: .leading, spacing: 4) {
+            Text("ANSWER")
+                .font(AppFont.rowLabel)
+                .tracking(0.6)
+                .foregroundStyle(palette.dim)
+            TextField("Optional — add anything the slides don't say",
+                      text: bind(\.back, default: ""), axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(AppFont.question(13.5))
+                .foregroundStyle(palette.ink)
+                .lineLimit(2...8)
+                .focused($focusedField, equals: .answer)
+                .padding(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7).stroke(palette.line, lineWidth: 1)
+                )
+        }
+        .padding(.top, 2)
+    }
+
+    // MARK: Cloze
+
+    /// The cloze text plus the two ways to hide a phrase in it.
+    ///
+    /// Slides live on the answer row underneath, so a cloze question reads the
+    /// same way a Basic one does: the text is the card, the slides are what you
+    /// look at once you have answered.
+    @ViewBuilder
+    private func clozeEditor(_ question: Question) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("Type the sentence, then select the part to hide…",
+                      text: bind(\.front, default: ""), axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(AppFont.question(15))
+                .foregroundStyle(palette.ink)
+                .lineLimit(2...10)
+                .focused($focusedField, equals: .question)
+
+            HStack(spacing: 10) {
+                Button("Hide selection") { hideSelection(newCard: true) }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
+                    .help("Hide the selected words on a card of their own — ⌘⇧C")
+
+                Button("Add to last card") { hideSelection(newCard: false) }
+                    .disabled(question.clozeOrdinals.isEmpty)
+                    .help("Hide these words on the same card as the previous deletion, so both are blanked together")
+
+                Spacer(minLength: 0)
+
+                Text(clozeCountLabel(question))
+                    .font(.system(size: 11))
+                    .foregroundStyle(question.clozeHasNoDeletions && !question.front.isEmpty
+                                     ? Theme.retired : palette.dim)
             }
-            .padding(.top, 2)
+            .font(.system(size: 11.5))
+        }
+    }
+
+    private func clozeCountLabel(_ question: Question) -> String {
+        let count = question.clozeOrdinals.count
+        if count == 0 {
+            return question.front.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Select words and press ⌘⇧C"
+                : "Nothing hidden yet — this makes no cards"
+        }
+        return count == 1 ? "Makes 1 card" : "Makes \(count) cards"
+    }
+
+    /// Wraps whatever is selected in the text field in `{{cN::…}}`.
+    ///
+    /// The selection is read from the window's field editor rather than from
+    /// SwiftUI, which does not expose it. A plain TextField is backed by an
+    /// NSTextView while it is focused, so this is the same text the caret sits
+    /// in -- and when nothing is focused or nothing is selected, this says so
+    /// rather than silently doing nothing.
+    private func hideSelection(newCard: Bool) {
+        guard let question = state.document?.question(qid: qid), question.kind == .cloze else { return }
+
+        guard let editor = NSApp.keyWindow?.firstResponder as? NSTextView,
+              editor.selectedRange().length > 0,
+              // The field editor's string can lag the model by a keystroke, and
+              // offsets taken from one string applied to another land in the
+              // wrong place. Better to do nothing than to hide the wrong words.
+              editor.string == question.front,
+              let range = Range(editor.selectedRange(), in: question.front) else {
+            state.statusMessage = "Select the words you want to hide first."
+            return
+        }
+
+        if !state.hideCloze(range: range, newCard: newCard) {
+            state.statusMessage = "That selection is already hidden."
         }
     }
 
@@ -361,18 +460,8 @@ struct QuestionCard: View {
                 // keystroke, with your answers picked out in amber.
                 TemplatePreview(template: template, blanks: question?.blanks ?? [:])
 
-                ForEach(template.blanks) { blank in
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
-                        Text(blank.label.uppercased())
-                            .font(AppFont.rowLabel)
-                            .tracking(0.6)
-                            .foregroundStyle(palette.dim)
-                            .frame(width: 104, alignment: .leading)
-                        TextField("", text: bindBlank(blank.key),
-                                  axis: blank.multiline ? .vertical : .horizontal)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 13))
-                    }
+                ForEach(Array(template.blanks.enumerated()), id: \.element.id) { index, blank in
+                    templateBlank(blank, isFirst: index == 0)
                 }
             }
         } else {
@@ -448,6 +537,32 @@ struct QuestionCard: View {
         .overlay(
             RoundedRectangle(cornerRadius: 7).stroke(palette.line, lineWidth: 1)
         )
+    }
+
+    /// One blank of a template.
+    ///
+    /// The first one carries this card's question focus, so the caret has
+    /// somewhere to land on ⌘N and Tab has somewhere to go. `.focused` cannot be
+    /// applied conditionally with a nil value -- the modifier takes a
+    /// non-optional -- so the two cases are separate branches.
+    @ViewBuilder
+    private func templateBlank(_ blank: TemplateBlank, isFirst: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(blank.label.uppercased())
+                .font(AppFont.rowLabel)
+                .tracking(0.6)
+                .foregroundStyle(palette.dim)
+                .frame(width: 104, alignment: .leading)
+            let field = TextField("", text: bindBlank(blank.key),
+                                  axis: blank.multiline ? .vertical : .horizontal)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 13))
+            if isFirst {
+                field.focused($focusedField, equals: .question)
+            } else {
+                field
+            }
+        }
     }
 
     private func questionRow(_ question: Question) -> some View {

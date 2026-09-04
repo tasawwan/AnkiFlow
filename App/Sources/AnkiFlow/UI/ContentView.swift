@@ -22,7 +22,11 @@ struct ContentView: View {
                 pdfArea
                 if state.showThumbnails {
                     Divider().overlay(palette.line)
-                    ThumbnailStrip(box: state.pdfBox)
+                    ThumbnailStrip(box: state.pdfBox, currentPage: $state.currentPage,
+                                   showFlaggedOnly: state.showFlaggedPagesOnly) { source, destination in
+                        state.movePage(from: source, to: destination)
+                    }
+                    .id(state.showFlaggedPagesOnly)
                         .frame(height: 92)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 7)
@@ -76,6 +80,24 @@ struct ContentView: View {
                 .environmentObject(state)
                 .environment(\.palette, palette)
         }
+        .alert("Save your marks first?", isPresented: $state.confirmingDiscardEdits) {
+            // Only leave if the write actually succeeded -- a failed save that
+            // closed editing anyway would drop the marks it just failed to keep.
+            Button("Save") { if state.savePDFEdits() { state.stopEditingPDF() } }
+            Button("Discard", role: .destructive) { state.stopEditingPDF(discardingChanges: true) }
+            Button("Keep Editing", role: .cancel) { state.confirmingDiscardEdits = false }
+        } message: {
+            Text("You've marked up this PDF but haven't saved it. Discarding throws those marks away.")
+        }
+        .alert("Delete slide \(state.currentPage)?", isPresented: $state.confirmingPageDelete) {
+            Button("Delete Slide", role: .destructive) { state.deleteCurrentPage() }
+            Button("Cancel", role: .cancel) { state.confirmingPageDelete = false }
+        } message: {
+            // The only edit in this app that asks. Everything else here can be
+            // put back by doing the opposite; a deleted page is gone from the
+            // file, and ⌘U cannot bring it back.
+            Text("This removes the page from \(state.document?.pdfURL.lastPathComponent ?? "the PDF") itself. Undo can't bring it back, and any question pointing at it will lose that slide.")
+        }
         .background(WindowOpenerBridge())
     }
 
@@ -84,26 +106,6 @@ struct ContentView: View {
     /// noticing an inserted slide and finding out weeks later in Anki.
     @ViewBuilder
     private var noticeBar: some View {
-        if let message = state.statusMessage {
-            HStack(spacing: 10) {
-                Text(message)
-                    .font(.system(size: 12))
-                    .foregroundStyle(palette.ink2)
-                Spacer(minLength: 8)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(palette.surface)
-            .overlay(alignment: .bottom) {
-                Rectangle().fill(palette.line).frame(height: 1)
-            }
-            .task(id: message) {
-                // Transient: it reports something that already happened, so it
-                // shouldn't sit there for the rest of the session.
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                state.statusMessage = nil
-            }
-        }
         if let document = state.document {
             if let problem = document.loadError {
                 // This one blocks every save until the file is readable, so it
@@ -173,18 +175,42 @@ struct ContentView: View {
     private var pdfArea: some View {
         if let document = state.document?.document {
             VStack(spacing: 0) {
+                // Always present: collapsed it is just the Edit PDF button,
+                // expanded it is the tools. One row either way, so turning
+                // editing on doesn't shove the page down.
+                PDFEditBar()
                 if state.findVisible {
                     FindBar()
                 }
+                // Status banner lives here rather than above the PDF pane so
+                // it slides in below the toolbar instead of pushing it down.
+                statusBanner
                 PDFPane(box: state.pdfBox,
                         document: document,
                         currentPage: $state.currentPage,
                         cropForPage: { state.crop(forPage: $0) },
                         masksForPage: { state.masks(forPage: $0) },
-                        onCrop: { page, rect in state.regionDragged(rect, page: page) })
+                        onCrop: { page, rect in state.regionDragged(rect, page: page) },
+                        session: state.editSession,
+                        editTool: state.isEditingPDF ? state.editTool : nil,
+                        strokeColour: state.editStroke.nsColor,
+                        fillColour: state.editFill?.nsColor,
+                        editLineWidth: state.editLineWidth,
+                        editFontSize: state.editFontSize,
+                        editBold: state.editBold,
+                        editItalic: state.editItalic,
+                        editUnderline: state.editUnderline,
+                        findAnnotationHighlight: state.findAnnotationHighlight,
+                        onToolUsed: { state.toolWasUsed() },
+                        onMessage: { state.statusMessage = $0 })
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Through the responder chain, so a focused find bar or page-range
+            // field gets Esc first and only an unhandled one leaves edit mode.
+            .onExitCommand {
+                if state.isEditingPDF { state.stopEditingPDF() }
+            }
         } else {
             ZStack {
                 palette.field
@@ -202,6 +228,29 @@ struct ContentView: View {
                 .padding(40)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private var statusBanner: some View {
+        HStack(spacing: 10) {
+            if let message = state.statusMessage {
+                Text(message)
+                    .font(.system(size: 12))
+                    .foregroundStyle(palette.ink2)
+            }
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 29)
+        .background(palette.surface.opacity(state.statusMessage == nil ? 0 : 1))
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(palette.line.opacity(state.statusMessage == nil ? 0 : 1)).frame(height: 1)
+        }
+        .task(id: state.statusMessage) {
+            guard state.statusMessage != nil else { return }
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            state.statusMessage = nil
         }
     }
 

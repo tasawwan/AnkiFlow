@@ -62,15 +62,19 @@ App/
 
 ## Invariants you must not break
 
-Three things are load-bearing. Everything else in the app is a convenience; these are why re-exporting updates your cards instead of duplicating them, and all three are covered by the test suite.
+Three things are load-bearing. Everything else in the app is a convenience; these are why re-exporting updates your cards instead of duplicating them. The exporter round-trip tests cover the identifier, timestamp, and content-hash invariants; PDF editing, flags, and UI navigation are not currently covered by automated tests.
 
-**Frozen identifiers** (`Model/Identifiers.swift`). The note type name and id, the seven field names and their order, and the sidecar extension are permanent. Each question's ULID becomes its Anki note GUID verbatim, and Anki matches notes by GUID *within a note type*. Change either after a user's first export and every studied card orphans — new cards appear, the old ones stay behind with their review history and no way to reconcile them.
+**Frozen identifiers** (`Model/Identifiers.swift`). *Both* note type names and ids, the seven field names and their order, and the sidecar extension are permanent. Each question's ULID becomes its Anki note GUID verbatim, and Anki matches notes by GUID *within a note type*. Change either after a user's first export and every studied card orphans — new cards appear, the old ones stay behind with their review history and no way to reconcile them.
+
+There are two models: the standard one and a cloze one, sharing the same seven fields in the same order so the exporter builds one field array for every kind of question. Anything that hands Anki a *search* must scope to both — `AnkiIdentity.noteTypeScope` exists for that, and a search naming only one model silently misses every cloze card.
 
 **The `mod` discipline** (`Export/AnkiExporter.swift`). Anki only updates a note whose `mod` timestamp is *strictly* newer than the copy in the collection. Equal timestamps are silently treated as duplicates and skipped — **along with the note's media**, which surfaces as a card with a missing image and no error anywhere. The exporter therefore stamps `max(now, previousMod + 1)` for changed notes, and re-stamps the *unchanged* previous value for notes whose content hash matches, so Anki correctly skips them.
 
 **`Question.contentHash`** decides what counts as changed. It hashes text, blanks, page lists, crops, masks, occlusion mode, tags, the template's fingerprint, the library's render version, and the PDF's own hash. That last one is easy to overlook and important: media filenames derive from the PDF hash, so an annotated PDF produces new image files — without the hash in the content hash, the exporter would call the note unchanged and Anki would keep showing images that no longer exist.
 
 If you add anything that changes how a card renders, it must go into `contentHash` **and** into the media filename if it changes the image. Missing either produces a silent wrong-picture bug rather than a visible failure.
+
+When a *drawing* changes rather than a card's content, the library-wide `renderVersion` is the general tool — but it re-renders and re-exports everything. For a change that affects one kind of card, add a scoped revision token to `contentHash` under a condition instead, and spell the media fingerprint so the unaffected cases produce byte-identical filenames. `allAtOnce-r2` in `Question.contentHash` and the `"o"` component of `MaskPaint.fingerprint` are the worked example: only all-at-once occlusion answers changed, and only those re-exported.
 
 ---
 
@@ -79,7 +83,7 @@ If you add anything that changes how a card renders, it must go into `contentHas
 **Decide immediately whether your fork shares a card lineage with AnkiFlow.**
 
 - **Sharing** (a patch you intend to upstream, or a build for your own existing decks): leave `AnkiIdentity` alone. Your exports will merge with cards AnkiFlow already made.
-- **Diverging** (a differently-named app, a different card design): change `appName`, `noteTypeName`, `noteTypeID`, `deckRoot`, `sidecarExtension` and `repository` in `Identifiers.swift` **before anyone exports anything**. Pick a fresh random 64-bit `noteTypeID`. Two apps sharing a note type id but disagreeing about its fields will corrupt each other's notes.
+- **Diverging** (a differently-named app, a different card design): change `appName`, `noteTypeName`, `noteTypeID`, `clozeNoteTypeName`, `clozeNoteTypeID`, `deckRoot`, `sidecarExtension` and `repository` in `Identifiers.swift` **before anyone exports anything**. Pick a fresh random 64-bit id for each note type. Two apps sharing a note type id but disagreeing about its fields will corrupt each other's notes.
 
 There is no migration path between the two once cards exist. Choose before you ship.
 
@@ -118,6 +122,8 @@ A question carries `qid` (ULID), `type`, `front`, `back`, `blanks`, `questionPag
 | | |
 |---|---|
 | `library.json` | Deck root, tag definitions, render settings, `renderVersion` |
+
+`AnkiIdentity.deckRoot` is the fallback, not the default: a library with no `library.json` yet starts with its own folder name as the deck root. A library that already has one keeps whatever it says, because moving an existing deck root would leave every studied card behind in the old tree — Anki does not move cards between decks on import.
 | `cache/` | Rendered slide images. Safe to delete; regenerated on demand. |
 | `history/` | Save snapshots, last 20 per lecture |
 | `undo.json` | Library-wide undo and redo stacks |
@@ -149,6 +155,30 @@ Back:   {{FrontSide}}
 ```
 
 `Extra` being searchable-but-invisible is deliberate: Anki's browser searches every field whether the template renders it or not, so cards can be found by what a slide said.
+
+### The cloze note type
+
+The same seven fields, `"type": 1`, one template, and a different id. The cloze text lives in `Front`.
+
+```
+Front:  <div class="q">{{cloze:Front}}</div>
+        {{FrontMedia}}
+
+Back:   <div class="q">{{cloze:Front}}</div>
+        {{FrontMedia}}
+        {{#Back}}<hr id="answer"><div class="a">{{Back}}</div>{{/Back}}
+        {{BackMedia}}
+        <div class="src">{{Source}}</div>
+```
+
+The back repeats the cloze rather than using `{{FrontSide}}`: on a cloze card `{{FrontSide}}` keeps the deletion hidden, so the answer would never appear.
+
+**This is the only kind that makes several cards from one note.** Everything else — including a separate-mode occlusion question — makes several *notes*, each with its own GUID. A cloze note gets one row in `cards` per distinct `{{cN::}}` ordinal, with `ord = N - 1`; that `ord` is what tells Anki which deletion each card hides. `Cloze.ordinals` is the single source of that set, used by the exporter and the preview alike.
+
+Two consequences worth knowing before you touch this:
+
+- Card ids come from their own counter, not from `noteID + 1`. With several cards per note the derived form collides.
+- A cloze note with no deletions generates no cards. Anki accepts it and it then sits in the collection invisible, so the exporter skips it and reports the count in `ExportSummary.skippedCloze`.
 
 ---
 
@@ -202,6 +232,23 @@ Every component earns its place. The PDF hash means an edited PDF produces new f
 
 **`PDFPane.swift`** — the viewer, two-way bound to the current page so ⌘↓/⌘↑ work while the cursor sits in a text field. `CropOverlayView` sits above it as a sibling and is invisible to the mouse unless ⌥ is held, which is why cropping needs no mode. It **never touches the `PDFDocument`** — PDFKit would happily draw the rectangle as an annotation, but the renderer reads the same document and the box would be baked into the exported image. It tracks drags in an event loop rather than relying on `mouseDragged`, which PDFKit swallows, and redraws on the scroll view's bounds notifications so overlays follow the page.
 
+**`PDFEditing.swift` / `PDFEditSession.swift` / `PDFEditOverlay.swift`** — the deliberate exception: the only code in the app that writes to the user's lecture file. `PDFEditOverlayView` is a second sibling above the crop overlay whose `hitTest` returns nil unless a tool is in hand, so with editing off the pane behaves exactly as it did before this existed.
+
+`PDFEditSession` is what makes the editor trustworthy. Annotations are added to the **in-memory** `PDFDocument` — which is what the `PDFView` draws, so a mark appears at once — and nothing reaches the file until ⌘S. Undo is a private pair of closure stacks rather than an `NSUndoManager`: AppKit's is shared with every text field in the window, and ⌘U already means "undo what I did to my questions", so `AppState.undo()` routes to the session only while `isEditingPDF`.
+
+Two rules in that file are easy to get wrong:
+
+- **`perform` runs the redo closure; `record` does not.** A drag applies itself as you drag, so replaying it on the way in would move the mark twice. Anything applied live is `record`ed.
+- **Annotation geometry is not always `bounds`.** Ink keeps its paths and Line keeps its endpoints, both with `bounds` pinned to the media box so the two possible PDFKit readings of "relative to bounds" coincide. `PDFEditing.move`, `frame(of:)` and `isResizable` branch on `kind(of:)`, which strips the leading slash PDF puts on a subtype name — branching on the raw `type` gives you an editor where lines and sketches silently refuse to move.
+
+Two rules hold it together, and both are easy to break by accident:
+
+**Every operation reports what it did to the numbering.** `PDFEditing.Change` carries `remap` (old 1-based page → new), `removed` (old numbers that are gone) and `boxChanges` (keyed by *new* number). `LectureDocument.applyPDFEdit` consumes them in a fixed order — remove, then remap, then convert boxes — because `removed` is in the old numbering and `boxChanges` is in the new one. Doing the removal after the remap deletes the *wrong* slide from every question: the deleted page's old number now belongs to whatever moved up into it. `applyPageShift` has the same ordering for the same reason.
+
+**Changing a page box rewrites the crops on that page.** Crops and masks are fractions of the crop box. Trim the box without converting them and every one of them points somewhere else — silently, on cards that already have review history. `CropRect.converted(from:to:)` is that conversion.
+
+The other thing to know: because `contentHash` includes the PDF's hash, *any* edit here re-exports every note in that lecture. That is correct — every slide image changed — but it means a single pen stroke is not a cheap operation at export time.
+
 ---
 
 ## UI conventions
@@ -226,6 +273,8 @@ The likeliest fork. Five places, in order:
 
 If it stores new per-question data, add it to `Question`, to `encode(to:)`, and to `contentHash`. If it changes the rendered image, add it to the media filename too.
 
+If it needs its own Anki note type, there are three more: register the model in `writeCollectionRow`, pick the `mid` per note in the export loop, and add its name to `AnkiIdentity.noteTypeScope` so the retire, move and delete searches still find its cards. Cloze is the worked example.
+
 ---
 
 ## Testing
@@ -237,7 +286,7 @@ pip install anki genanki
 python3 Tests/AnkiRoundTrip/test_roundtrip.py
 ```
 
-Thirty-nine checks, covering crops, occlusion (including per-mask scheduling and deletion), same-second re-exports, moved lectures and retired questions.
+Sixty checks, covering crops, occlusion (including per-mask scheduling and deletion), cloze (ordinal-to-card generation, scheduling across all of a note's cards, repeated and missing ordinals), same-second re-exports, moved lectures and retired questions.
 
 **If you touch `Export/`, run it.** The behaviours it pins down — the `mod` rule, duplicate skipping, and the media consequence of a skipped note — are not documented by Anki and were established by experiment. They are easy to break by reasoning and hard to notice by hand: the symptom is a card that quietly stops updating, or an image that quietly stops existing.
 

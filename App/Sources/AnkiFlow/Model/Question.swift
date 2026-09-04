@@ -7,6 +7,11 @@ enum QuestionKind: String, Codable {
     case slide2slide
     case template
     case occlusion
+    /// Text with `{{c1::…}}` deletions. Unlike every other kind this makes one
+    /// note with several cards -- one per distinct ordinal -- and it is the only
+    /// kind exported under the cloze note type. Slides attached to it appear on
+    /// the back, as explanation after the answer is revealed.
+    case cloze
 }
 
 /// One hidden region on an occlusion slide.
@@ -281,18 +286,43 @@ struct Question: Codable, Identifiable, Equatable {
     mutating func remapPages(_ map: [Int: Int]) {
         questionPages = PageSet.normalise(questionPages.map { map[$0] ?? $0 })
         answerPages = PageSet.normalise(answerPages.map { map[$0] ?? $0 })
-        questionCrops = Dictionary(uniqueKeysWithValues:
-            questionCrops.map { page, crop in (map[page] ?? page, crop) })
-        answerCrops = Dictionary(uniqueKeysWithValues:
-            answerCrops.map { page, crop in (map[page] ?? page, crop) })
+        // `uniquingKeysWith`, not `uniqueKeysWithValues`: a page the map says
+        // nothing about keeps its own number, and that number can be the one
+        // some other page was mapped *to*. `uniqueKeysWithValues` traps on the
+        // collision -- it crashed the app when a slide with a crop was deleted
+        // and the slide after it moved up into its number. Keeping the lower
+        // page's crop matches the page lists, which normalise the same way.
+        // Sorted before folding, because a Dictionary iterates in hash order:
+        // without this "first wins" would mean "whichever the hash happened to
+        // hand over first", and two runs could keep different crops.
+        questionCrops = Dictionary(
+            questionCrops.sorted { $0.key < $1.key }.map { (map[$0.key] ?? $0.key, $0.value) },
+            uniquingKeysWith: { first, _ in first })
+        answerCrops = Dictionary(
+            answerCrops.sorted { $0.key < $1.key }.map { (map[$0.key] ?? $0.key, $0.value) },
+            uniquingKeysWith: { first, _ in first })
     }
 
-    /// Stop citing a slide entirely, on both sides.
-    mutating func removePage(_ page: Int) {
+    /// Stop citing a slide entirely, on both sides. Returns the ids of any
+    /// masks dropped along with it, so the caller can retire their cards.
+    ///
+    /// Masks go whenever the slide they were drawn on goes -- not only when the
+    /// question is left with no pages at all. `occlusionPage` is just the first
+    /// page the question cites, so a question citing slides 3 and 7 that loses
+    /// slide 3 would otherwise keep masks drawn for slide 3 and quietly start
+    /// applying them to slide 7, hiding whatever happens to be in those
+    /// rectangles there.
+    @discardableResult
+    mutating func removePage(_ page: Int) -> [String] {
+        let wasOcclusionPage = kind == .occlusion && occlusionPage == page
         questionPages.removeAll { $0 == page }
         answerPages.removeAll { $0 == page }
         questionCrops[page] = nil
         answerCrops[page] = nil
+        guard wasOcclusionPage, !masks.isEmpty else { return [] }
+        let dropped = masks.map(\.id)
+        masks = []
+        return dropped
     }
 
     /// Drop crops for pages the question no longer cites. Without this a crop
@@ -304,6 +334,24 @@ struct Question: Codable, Identifiable, Equatable {
         let back = Set(answerPages)
         questionCrops = questionCrops.filter { front.contains($0.key) }
         answerCrops = answerCrops.filter { back.contains($0.key) }
+    }
+
+    // MARK: - Cloze
+
+    /// The ordinals this question's text contains, which is exactly the set of
+    /// cards Anki will generate from it.
+    var clozeOrdinals: [Int] {
+        kind == .cloze ? Cloze.ordinals(in: front) : []
+    }
+
+    /// True when a cloze question has text but no `{{c1::…}}` in it yet.
+    ///
+    /// Worth its own name because it is the one way this app can produce a note
+    /// Anki makes *no* cards for: a cloze note with no deletions imports fine
+    /// and then sits in the collection invisible. The exporter skips these and
+    /// the panel says so rather than letting one leave the building.
+    var clozeHasNoDeletions: Bool {
+        kind == .cloze && Cloze.ordinals(in: front).isEmpty
     }
 
     // MARK: - Occlusion
@@ -363,6 +411,10 @@ struct Question: Codable, Identifiable, Equatable {
         switch kind {
         case .basic, .slide2slide, .occlusion:
             text = front
+        case .cloze:
+            // The markup would dominate a one-line label, so the list shows the
+            // sentence as it reads with nothing hidden.
+            text = Cloze.plainText(front)
         case .template:
             text = template.map { $0.render(blanks: blanks).front } ?? front
         }
@@ -411,6 +463,21 @@ struct Question: Codable, Identifiable, Equatable {
             variant,
             tags.sorted().joined(separator: ",")
         ]
+        // A revision scoped to one kind of card.
+        //
+        // The library-wide `renderVersion` is the general tool for "the drawing
+        // changed, re-render everything", and it is too big a hammer here: the
+        // all-at-once answer gained boxes around the regions it had covered, and
+        // nothing else in the library draws differently. Bumping the library
+        // version would re-render and re-export every card in it to fix a
+        // handful. This changes the hash for exactly the cards whose picture
+        // changed. Bump the number if that drawing changes again.
+        // `!masks.isEmpty` matters: with no masks both sides render as the bare
+        // slide, the filenames are unchanged, and the card is byte-identical --
+        // so there is nothing to re-export and no reason to say there is.
+        if kind == .occlusion, occlusionMode == .allAtOnce, !masks.isEmpty {
+            parts.append("allAtOnce-r2")
+        }
         for key in blanks.keys.sorted() {
             parts.append("\(key)=\(blanks[key] ?? "")")
         }

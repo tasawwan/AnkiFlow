@@ -81,10 +81,13 @@ struct PageRenderer {
         /// Filled opaque in the accent colour: hidden, and this is the region
         /// the card is asking about.
         var target: CropRect?
-        /// Stroked, not filled: visible, and this is the region it asked about.
-        var outlined: CropRect?
+        /// Stroked, not filled: visible, and these are the regions the card
+        /// asked about. One for a card testing a single region; all of them on
+        /// the back of an all-at-once card, where the answer is "here is what
+        /// was covered" and the boxes are what say where.
+        var outlined: [CropRect] = []
 
-        var isEmpty: Bool { hidden.isEmpty && target == nil && outlined == nil }
+        var isEmpty: Bool { hidden.isEmpty && target == nil && outlined.isEmpty }
 
         /// Every distinct combination of masks is a distinct image and must be a
         /// distinct filename -- six cards off one slide are six different
@@ -92,7 +95,13 @@ struct PageRenderer {
         var fingerprint: String {
             var parts = hidden.map(\.fingerprint)
             parts.append("t" + (target?.fingerprint ?? "-"))
-            parts.append("o" + (outlined?.fingerprint ?? "-"))
+            // Spelled so that none and one produce exactly the strings the
+            // single-rect version produced. Cards that were already right keep
+            // their filenames, and only the all-at-once backs -- the ones whose
+            // picture actually changed -- get new ones.
+            parts.append("o" + (outlined.isEmpty
+                                ? "-"
+                                : outlined.map(\.fingerprint).joined(separator: "+")))
             let digest = SHA256.hash(data: Data(parts.joined(separator: ",").utf8))
             return digest.prefix(5).map { String(format: "%02x", $0) }.joined()
         }
@@ -164,6 +173,11 @@ struct PageRenderer {
         context.interpolationQuality = .high
         context.scaleBy(x: scale, y: scale)
         context.translateBy(x: -bounds.origin.x, y: -bounds.origin.y)
+        let flags = page.annotations.filter { annotation in
+            PDFEditing.isFlag(annotation)
+        }
+        flags.forEach { $0.shouldDisplay = false }
+        defer { flags.forEach { $0.shouldDisplay = true } }
         page.draw(with: box, to: context)
 
         if let masks, !masks.isEmpty {
@@ -178,10 +192,12 @@ struct PageRenderer {
                 context.setFillColor(Self.targetFill)
                 context.fill(target.rect(in: pageBounds))
             }
-            if let outlined = masks.outlined {
+            if !masks.outlined.isEmpty {
                 context.setStrokeColor(Self.targetFill)
                 context.setLineWidth(max(2, pageBounds.width * 0.006))
-                context.stroke(outlined.rect(in: pageBounds))
+                for rect in masks.outlined {
+                    context.stroke(rect.rect(in: pageBounds))
+                }
             }
         }
         context.restoreGState()

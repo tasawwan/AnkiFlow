@@ -14,6 +14,15 @@ final class PDFViewBox: ObservableObject {
         view.displayDirection = .vertical
         return view
     }()
+    weak var editOverlay: PDFEditOverlayView?
+
+    func toggleFontTrait(_ trait: NSFontTraitMask) -> Bool {
+        editOverlay?.toggleFontTrait(trait) ?? false
+    }
+
+    func toggleUnderline() -> Bool {
+        editOverlay?.toggleUnderline() ?? false
+    }
 }
 
 /// The PDF viewer. Two-way bound to the current page so ⌘↓ / ⌘↑ can drive it
@@ -29,6 +38,21 @@ struct PDFPane: NSViewRepresentable {
     /// Occlusion masks on this page, drawn so you can see what you have hidden.
     var masksForPage: (Int) -> [CropRect] = { _ in [] }
     var onCrop: (Int, CropRect) -> Void = { _, _ in }
+    /// The live editing session, or nil when not editing.
+    var session: PDFEditSession?
+    /// The tool in hand, or nil. Nil keeps the edit overlay invisible to the
+    /// mouse, so the pane behaves exactly as it did before that feature.
+    var editTool: PDFEditing.Tool?
+    var strokeColour: NSColor = .systemYellow
+    var fillColour: NSColor?
+    var editLineWidth: Double = 2
+    var editFontSize: Double = 14
+    var editBold = false
+    var editItalic = false
+    var editUnderline = false
+    var findAnnotationHighlight: (PDFPage, CGRect)?
+    var onToolUsed: () -> Void = { }
+    var onMessage: (String) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(currentPage: $currentPage)
@@ -36,7 +60,10 @@ struct PDFPane: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSView {
         let container = NSView()
+        container.wantsLayer = true
+        container.layer?.masksToBounds = true
         let view = box.view
+        view.clipsToBounds = true
         view.backgroundColor = NSColor(palette.field)
         // Dark mode is a lightbox: the page carries a shadow so it reads as the
         // only lit object. Light mode is paper on paper, so it doesn't.
@@ -57,6 +84,17 @@ struct PDFPane: NSViewRepresentable {
         container.addSubview(overlay)
         context.coordinator.overlay = overlay
 
+        // Above the crop overlay, and inert until a tool is picked up. Order
+        // matters: with no tool both overlays pass the mouse through, with a
+        // tool this one takes it, and ⌥-crop keeps working in between.
+        let editOverlay = PDFEditOverlayView()
+        editOverlay.pdfView = view
+        editOverlay.startObservingScroll()
+        editOverlay.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(editOverlay)
+        context.coordinator.editOverlay = editOverlay
+        box.editOverlay = editOverlay
+
         NSLayoutConstraint.activate([
             view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
@@ -65,7 +103,11 @@ struct PDFPane: NSViewRepresentable {
             overlay.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             overlay.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             overlay.topAnchor.constraint(equalTo: container.topAnchor),
-            overlay.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            overlay.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            editOverlay.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            editOverlay.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            editOverlay.topAnchor.constraint(equalTo: container.topAnchor),
+            editOverlay.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         return container
     }
@@ -82,6 +124,31 @@ struct PDFPane: NSViewRepresentable {
             overlay.onCommit = onCrop
             overlay.needsDisplay = true
         }
+        if let editOverlay = context.coordinator.editOverlay {
+            // Leaving editing has to take the text editor down with it, or a
+            // half-typed note is left floating over a pane that is no longer in
+            // edit mode.
+            if editTool == nil && editOverlay.tool != nil { editOverlay.commitTextEditing() }
+            if editOverlay.tool != editTool { editOverlay.clearTextSelection() }
+            editOverlay.suppressTextAnnotations(true)
+            editOverlay.session = session
+            editOverlay.tool = editTool
+            editOverlay.strokeColour = strokeColour
+            editOverlay.fillColour = fillColour
+            editOverlay.lineWidth = CGFloat(editLineWidth)
+            editOverlay.fontSize = CGFloat(editFontSize)
+            editOverlay.fontBold = editBold
+            editOverlay.fontItalic = editItalic
+            editOverlay.fontUnderline = editUnderline
+            editOverlay.findAnnotationHighlight = findAnnotationHighlight
+            editOverlay.onToolUsed = onToolUsed
+            editOverlay.onMessage = onMessage
+            // The cursor is part of knowing which tool is in your hand.
+            editOverlay.window?.invalidateCursorRects(for: editOverlay)
+            editOverlay.needsDisplay = true
+        }
+        container.clipsToBounds = true
+        view.clipsToBounds = true
         if view.document !== document {
             view.document = document
             context.coordinator.lastReportedPage = 0
@@ -102,6 +169,7 @@ struct PDFPane: NSViewRepresentable {
         var suppressCallback = false
         var lastReportedPage = 0
         weak var overlay: CropOverlayView?
+        weak var editOverlay: PDFEditOverlayView?
         private weak var view: PDFView?
 
         init(currentPage: Binding<Int>) {
@@ -146,21 +214,128 @@ struct PDFPane: NSViewRepresentable {
 struct ThumbnailStrip: NSViewRepresentable {
     @Environment(\.palette) private var palette
     let box: PDFViewBox
+    @Binding var currentPage: Int
+    var showFlaggedOnly = false
+    var onMove: (Int, Int) -> Void = { _, _ in }
 
-    func makeNSView(context: Context) -> PDFThumbnailView {
-        let view = PDFThumbnailView()
-        view.thumbnailSize = NSSize(width: 60, height: 80)
-        // macOS has no `layoutMode`; a wide column count plus the short frame
-        // ContentView gives this view produces the horizontal strip.
-        view.maximumNumberOfColumns = 512
-        view.backgroundColor = NSColor(palette.field)
-        view.pdfView = box.view
-        return view
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = true
+        scroll.backgroundColor = NSColor(palette.field)
+        let gallery = ThumbnailGalleryView()
+        scroll.documentView = gallery
+        configure(gallery)
+        return scroll
     }
 
-    func updateNSView(_ view: PDFThumbnailView, context: Context) {
+    func updateNSView(_ view: NSScrollView, context: Context) {
         view.backgroundColor = NSColor(palette.field)
-        view.pdfView = box.view
+        if let gallery = view.documentView as? ThumbnailGalleryView {
+            configure(gallery)
+        }
+    }
+
+    private func configure(_ view: ThumbnailGalleryView) {
+        view.document = box.view.document
+        view.currentPage = currentPage
+        view.showFlaggedOnly = showFlaggedOnly
+        view.onSelect = { page in currentPage = page }
+        view.onMove = onMove
+        view.needsLayout = true
+        view.needsDisplay = true
+        let count = showFlaggedOnly
+            ? (box.view.document.map { document in
+                (0..<document.pageCount).filter { index in
+                    document.page(at: index)?.annotations.contains(where: PDFEditing.isFlag) == true
+                }.count
+            } ?? 0)
+            : (box.view.document?.pageCount ?? 0)
+        view.frame = NSRect(x: 0, y: 0,
+                            width: max(10 + CGFloat(count) * 74, view.superview?.bounds.width ?? 0),
+                            height: 92)
+        view.superview?.needsDisplay = true
+    }
+}
+
+/// A compact, horizontal gallery whose thumbnails can be reordered directly.
+final class ThumbnailGalleryView: NSView {
+    var document: PDFDocument? { didSet { needsDisplay = true } }
+    var currentPage = 1 { didSet { needsDisplay = true } }
+    var showFlaggedOnly = false { didSet { needsDisplay = true } }
+    var onSelect: ((Int) -> Void)?
+    var onMove: ((Int, Int) -> Void)?
+
+    private let thumbnailSize = NSSize(width: 64, height: 72)
+    private let gap: CGFloat = 10
+    private var dragPage: Int?
+    private var dragPoint: NSPoint?
+
+    private var displayedPages: [Int] {
+        guard let document else { return [] }
+        if !showFlaggedOnly { return Array(1...document.pageCount) }
+        return (0..<document.pageCount).compactMap { index in
+            guard let page = document.page(at: index),
+                  page.annotations.contains(where: PDFEditing.isFlag) else { return nil }
+            return index + 1
+        }
+
+    }
+
+    private func pageRect(_ index: Int) -> NSRect {
+        let x = 10 + CGFloat(index) * (thumbnailSize.width + gap)
+        return NSRect(x: x, y: 10, width: thumbnailSize.width, height: thumbnailSize.height)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let document else { return }
+        for (index, number) in displayedPages.enumerated() {
+            let rect = pageRect(index)
+            if number == currentPage {
+                NSColor.controlAccentColor.withAlphaComponent(0.22).setFill()
+                rect.insetBy(dx: -4, dy: -4).fill()
+            }
+            if let thumbnail = document.page(at: number - 1)?.thumbnail(of: thumbnailSize, for: .cropBox) {
+                thumbnail.draw(in: rect)
+            }
+            NSColor.separatorColor.setStroke()
+            NSBezierPath(rect: rect).stroke()
+            let label = "\(number)" as NSString
+            label.draw(at: NSPoint(x: rect.minX, y: 1),
+                       withAttributes: [.font: NSFont.systemFont(ofSize: 10),
+                                        .foregroundColor: NSColor.secondaryLabelColor])
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard document != nil else { return }
+        let pages = displayedPages
+        let sourceIndex = pages.indices.first { pageRect($0).contains(point) }
+        let source = sourceIndex.map { pages[$0] }
+        guard let source, let sourceIndex, let window else { return }
+        dragPage = source
+        dragPoint = point
+        var last = event
+        while true {
+            guard let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else { break }
+            last = next
+            if next.type == .leftMouseUp { break }
+        }
+        let end = convert(last.locationInWindow, from: nil)
+        let targetIndex = pages.indices.min {
+            abs(pageRect($0).midX - end.x) < abs(pageRect($1).midX - end.x)
+        } ?? sourceIndex
+        let target = pages[targetIndex]
+        let moved = abs(end.x - (dragPoint?.x ?? end.x)) > 4
+        dragPage = nil
+        dragPoint = nil
+        if moved && target != source {
+            onMove?(source, target)
+        } else {
+            onSelect?(source)
+        }
     }
 }
 

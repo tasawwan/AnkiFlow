@@ -42,9 +42,20 @@ enum AnkiIdentity {
     static let noteTypeName = "AnkiFlow Note v1"
     static let noteTypeID: Int64 = 2094605586
 
-    /// Reserved for future cloze support so the field set never has to change.
+    /// The cloze note type. Same seven fields in the same order; `type: 1` in
+    /// the model JSON is the only structural difference, and it is what makes
+    /// Anki generate one card per {{cN::}} ordinal.
     static let clozeNoteTypeName = "AnkiFlow Cloze v1"
     static let clozeNoteTypeID: Int64 = 1313277180
+
+    /// An Anki search term matching notes of either AnkiFlow model.
+    ///
+    /// Every search this app hands to Anki -- retiring questions, moving decks,
+    /// deleting notes -- must scope to *both*, or it silently misses every cloze
+    /// card the moment one exists.
+    static var noteTypeScope: String {
+        "(\"note:\(noteTypeName)\" OR \"note:\(clozeNoteTypeName)\")"
+    }
 
     /// Field order is part of the contract. Never reorder, never insert.
     static let fields = ["Front", "FrontMedia", "Back", "BackMedia", "Extra", "Source", "QID"]

@@ -86,6 +86,10 @@ struct PreviewSheet: View {
     private func reload() {
         guard let library = state.library else { return }
         session.load(lectures: state.previewLectures(library: library))
+        // Open on the card you were working on. `load` resets to the top, so
+        // this runs after it, and it quietly does nothing when that question
+        // isn't in the scope you are previewing.
+        if let qid = state.focusedQID { session.jump(toQuestion: qid) }
     }
 
     // MARK: - Chrome
@@ -166,23 +170,16 @@ struct PreviewSheet: View {
         if let item = session.current {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    side(item, back: false)
-                    if session.revealed {
-                        Rectangle().fill(palette.line).frame(height: 1)
-                        side(item, back: true)
+                    if item.question.kind == .cloze {
+                        clozeCardBody(item, revealed: session.revealed)
                     } else {
-                        Button { session.advance(); keyboard = true } label: {
-                            Text("Show answer")
-                                .font(.system(size: 12))
-                                .foregroundStyle(palette.dim)
-                                .padding(.vertical, 10)
-                                .frame(maxWidth: .infinity)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 7)
-                                        .strokeBorder(palette.line, lineWidth: 1)
-                                )
+                        side(item, back: false)
+                        if session.revealed {
+                            Rectangle().fill(palette.line).frame(height: 1)
+                            side(item, back: true)
+                        } else {
+                            showAnswerButton
                         }
-                        .buttonStyle(.plain)
                     }
                 }
                 .padding(26)
@@ -191,24 +188,135 @@ struct PreviewSheet: View {
         }
     }
 
+    private var showAnswerButton: some View {
+        Button { session.advance(); keyboard = true } label: {
+            Text("Show answer")
+                .font(.system(size: 12))
+                .foregroundStyle(palette.dim)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7)
+                        .strokeBorder(palette.line, lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
     // MARK: - Continuous
 
     private var scrollBody: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(session.items) { item in
-                    VStack(alignment: .leading, spacing: 16) {
-                        side(item, back: false)
-                        Rectangle().fill(palette.amber.opacity(0.45)).frame(height: 1)
-                        side(item, back: true)
-                    }
-                    .padding(26)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(session.items) { item in
+                        VStack(alignment: .leading, spacing: 16) {
+                            if item.question.kind == .cloze {
+                                clozeCardBody(item, revealed: true)
+                            } else {
+                                side(item, back: false)
+                                Rectangle().fill(palette.amber.opacity(0.45)).frame(height: 1)
+                                side(item, back: true)
+                            }
+                        }
+                        .padding(26)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .id(item.id)
 
-                    Rectangle().fill(palette.line).frame(height: 6).opacity(0.6)
+                        Rectangle().fill(palette.line).frame(height: 6).opacity(0.6)
+                    }
                 }
             }
+            // The scroll opens where the card view would have opened: on the
+            // question you were working on. Following `index` afterwards means
+            // switching layouts keeps your place rather than throwing you back
+            // to the top.
+            .onAppear { scroll(proxy) }
+            .onChange(of: session.index) { _, _ in scroll(proxy) }
         }
+    }
+
+    private func scroll(_ proxy: ScrollViewProxy) {
+        guard let id = session.current?.id else { return }
+        // Next runloop turn: scrolling a LazyVStack to a row that has not been
+        // built yet does nothing, and on first appearance none of them have.
+        DispatchQueue.main.async { proxy.scrollTo(id, anchor: .top) }
+    }
+
+    // MARK: - In-place Cloze
+
+    private func clozeAttributed(item: PreviewSession.Item, revealed: Bool) -> AttributedString {
+        let ordinal = item.clozeOrdinal ?? 1
+        let text = item.question.front
+        let deletions = Cloze.deletions(in: text)
+        guard !deletions.isEmpty else {
+            return AttributedString(text)
+        }
+        var attr = AttributedString()
+        var cursor = text.startIndex
+        for deletion in deletions {
+            guard deletion.range.lowerBound >= cursor else { continue }
+            attr.append(AttributedString(text[cursor..<deletion.range.lowerBound]))
+            if deletion.ordinal == ordinal {
+                if revealed {
+                    var ans = AttributedString("[\(deletion.answer)]")
+                    ans.font = .system(size: 17, weight: .bold)
+                    ans.foregroundColor = palette.amber
+                    attr.append(ans)
+                } else {
+                    let placeholder = deletion.hint.map { "[\($0)]" } ?? "[...]"
+                    var blank = AttributedString(placeholder)
+                    blank.font = .system(size: 17, weight: .bold)
+                    blank.foregroundColor = palette.amber
+                    attr.append(blank)
+                }
+            } else {
+                attr.append(AttributedString(deletion.answer))
+            }
+            cursor = deletion.range.upperBound
+        }
+        attr.append(AttributedString(text[cursor...]))
+        return attr
+    }
+
+    @ViewBuilder
+    private func clozeCardBody(_ item: PreviewSession.Item, revealed: Bool) -> some View {
+        let composition = session.composition(for: item)
+        let backText = item.question.back.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasBackExtras = !backText.isEmpty || !composition.back.isEmpty
+
+        VStack(alignment: .leading, spacing: 14) {
+            Text(clozeAttributed(item: item, revealed: revealed))
+                .font(AppFont.question(17))
+                .foregroundStyle(palette.ink)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+
+            if let ordinal = item.ordinal, let total = item.ordinalTotal {
+                Text("card \(ordinal) of \(total)")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(palette.dim)
+            }
+
+            slideImages(for: composition.front, in: item.pdfURL)
+
+            if revealed {
+                if hasBackExtras {
+                    Rectangle().fill(palette.line).frame(height: 1)
+                    if !backText.isEmpty {
+                        Text(backText)
+                            .font(AppFont.question(15))
+                            .foregroundStyle(palette.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                    slideImages(for: composition.back, in: item.pdfURL)
+                }
+            } else {
+                showAnswerButton
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - One side of one card
@@ -233,29 +341,34 @@ struct PreviewSheet: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(palette.dim)
             }
-            ForEach(specs, id: \.self) { spec in
-                if let image = session.image(spec, in: item.pdfURL) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: .infinity)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 3)
-                                .strokeBorder(palette.line, lineWidth: 1)
-                        )
-                } else {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(palette.surface)
-                        .frame(height: 120)
-                        .overlay(
-                            Text("slide \(spec.page) could not be rendered")
-                                .font(.system(size: 11))
-                                .foregroundStyle(palette.dim)
-                        )
-                }
-            }
+            slideImages(for: specs, in: item.pdfURL)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func slideImages(for specs: [CardComposition.ImageSpec], in pdfURL: URL) -> some View {
+        ForEach(specs, id: \.self) { spec in
+            if let image = session.image(spec, in: pdfURL) {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 3)
+                            .strokeBorder(palette.line, lineWidth: 1)
+                    )
+            } else {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(palette.surface)
+                    .frame(height: 120)
+                    .overlay(
+                        Text("slide \(spec.page) could not be rendered")
+                            .font(.system(size: 11))
+                            .foregroundStyle(palette.dim)
+                    )
+            }
+        }
     }
 
     private func editCurrent() {

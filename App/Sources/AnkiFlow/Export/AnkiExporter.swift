@@ -62,6 +62,11 @@ struct AnkiExporter {
         var decksJSON: [String: Any] = ["1": defaultDeckJSON()]
         var mediaFiles: [String: URL] = [:]      // media filename -> source on disk
         var noteCounter = Int64(Date().timeIntervalSince1970 * 1000)
+        // Cards get their own counter rather than being derived from the note
+        // id. A cloze note produces one card per ordinal, so "note id + 1" would
+        // hand the same id to the second card of one note and the first card of
+        // the next.
+        var cardCounter = noteCounter
         var cardPosition = 0
         let now = Int(Date().timeIntervalSince1970)
 
@@ -75,6 +80,23 @@ struct AnkiExporter {
             for index in plan.questions.indices {
                 var question = plan.questions[index]
                 guard !question.isEmpty else { continue }
+                // A cloze note with no deletions is a note Anki generates no
+                // cards for: it imports, sits in the collection, and is never
+                // shown. Better to leave it here than to ship an invisible note.
+                if question.clozeHasNoDeletions {
+                    summary.skippedCloze += 1
+                    // If it went out before -- deletions typed, exported, then
+                    // taken back out -- its cards are still in Anki. Reported
+                    // the same way a deleted question is, so the sheet offers to
+                    // clear them rather than leaving them to rot.
+                    if question.export != nil {
+                        summary.retired.append((
+                            qid: question.qid,
+                            lecture: plan.pdfURL.deletingPathExtension().lastPathComponent
+                        ))
+                    }
+                    continue
+                }
 
                 let template = templateLookup(question.templateId)
 
@@ -151,13 +173,16 @@ struct AnkiExporter {
                 let sortField = stripHTML(fields[0])
                 noteCounter += 1
                 let noteID = noteCounter
+                let modelID = question.kind == .cloze
+                    ? AnkiIdentity.clozeNoteTypeID
+                    : AnkiIdentity.noteTypeID
 
                 try database.run(
                     "INSERT INTO notes (id, guid, mid, mod, usn, tags, flds, sfld, csum, flags, data) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     [
                         .int(noteID),
                         .text(guid),                               // GUID: the merge key
-                        .int(AnkiIdentity.noteTypeID),
+                        .int(modelID),
                         .int(Int64(modification)),
                         .int(-1),
                         .text(tagString),
@@ -169,17 +194,27 @@ struct AnkiExporter {
                     ]
                 )
 
-                cardPosition += 1
-                try database.run(
-                    "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    [
-                        .int(noteID + 1), .int(noteID), .int(deckID), .int(0),
-                        .int(Int64(modification)), .int(-1),
-                        .int(0), .int(0), .int(Int64(cardPosition)),
-                        .int(0), .int(0), .int(0), .int(0), .int(0),
-                        .int(0), .int(0), .int(0), .text("")
-                    ]
-                )
+                // Every kind but cloze is one note, one card, ord 0. A cloze
+                // note gets one card per distinct ordinal, and the card's `ord`
+                // is the ordinal minus one -- that is the link Anki uses to
+                // decide which deletion each card hides.
+                let ordinals = question.kind == .cloze
+                    ? question.clozeOrdinals.map { $0 - 1 }
+                    : [0]
+                for ordinal in ordinals {
+                    cardCounter += 1
+                    cardPosition += 1
+                    try database.run(
+                        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        [
+                            .int(cardCounter), .int(noteID), .int(deckID), .int(Int64(ordinal)),
+                            .int(Int64(modification)), .int(-1),
+                            .int(0), .int(0), .int(Int64(cardPosition)),
+                            .int(0), .int(0), .int(0), .int(0), .int(0),
+                            .int(0), .int(0), .int(0), .text("")
+                        ]
+                    )
+                }
                 }
             }
 
@@ -230,6 +265,11 @@ struct AnkiExporter {
             return (paragraphs(question.front), paragraphs(question.back))
         case .occlusion:
             // The image is the question; any text is an optional prompt above it.
+            return (paragraphs(question.front), paragraphs(question.back))
+        case .cloze:
+            // The markup goes out untouched -- Anki's {{cloze:…}} does the
+            // hiding, and `paragraphs` escapes only & < >, none of which appear
+            // in {{cN::…}}. `back` is the explanation shown after the reveal.
             return (paragraphs(question.front), paragraphs(question.back))
         case .template:
             guard let template else { return (paragraphs(question.front), paragraphs(question.back)) }
@@ -370,7 +410,10 @@ struct AnkiExporter {
     }
 
     private func writeCollectionRow(_ database: SQLiteDB, decks: [String: Any]) throws {
-        let models: [String: Any] = [String(AnkiIdentity.noteTypeID): noteTypeJSON()]
+        let models: [String: Any] = [
+            String(AnkiIdentity.noteTypeID): noteTypeJSON(),
+            String(AnkiIdentity.clozeNoteTypeID): clozeNoteTypeJSON()
+        ]
         let configuration: [String: Any] = [
             "activeDecks": [1], "addToCur": true, "collapseTime": 1200, "curDeck": 1,
             "curModel": String(AnkiIdentity.noteTypeID), "dueCounts": true, "estTimes": true,
@@ -434,6 +477,57 @@ struct AnkiExporter {
             "latexPost": "\\end{document}",
             "latexsvg": false,
             "req": [[0, "any", [0, 1]]],
+            "tags": [],
+            "vers": []
+        ]
+    }
+
+    /// The cloze note type. Same seven fields in the same order as the standard
+    /// one, deliberately: the exporter builds one `fields` array for every kind
+    /// of question, and keeping the two models field-compatible means cloze
+    /// needed no new plumbing anywhere between the model and the SQL.
+    ///
+    /// `type: 1` is what makes it a cloze model. Anki then generates one card
+    /// per `{{cN::}}` ordinal found in the sort field rather than one card per
+    /// template -- which is why the card rows this file writes for a cloze note
+    /// come from `Cloze.ordinals`, not from `tmpls`.
+    private func clozeNoteTypeJSON() -> [String: Any] {
+        let fields = AnkiIdentity.fields.enumerated().map { index, name -> [String: Any] in
+            ["name": name, "ord": index, "sticky": false, "rtl": false,
+             "font": "Helvetica", "size": 20, "media": []]
+        }
+        // The cloze text is repeated on the back rather than pulled in with
+        // {{FrontSide}}: on a cloze card {{FrontSide}} keeps the deletion
+        // hidden, so the answer would never appear.
+        let front = """
+        <div class="q">{{cloze:Front}}</div>
+        {{FrontMedia}}
+        """
+        let back = """
+        <div class="q">{{cloze:Front}}</div>
+        {{FrontMedia}}
+        {{#Back}}<hr id="answer"><div class="a">{{Back}}</div>{{/Back}}
+        {{BackMedia}}
+        <div class="src">{{Source}}</div>
+        """
+        return [
+            "id": String(AnkiIdentity.clozeNoteTypeID),
+            "name": AnkiIdentity.clozeNoteTypeName,
+            "type": 1,
+            "mod": Int(Date().timeIntervalSince1970),
+            "usn": -1,
+            "sortf": 0,
+            "did": 1,
+            "tmpls": [[
+                "name": "Cloze", "ord": 0, "qfmt": front, "afmt": back,
+                "bqfmt": "", "bafmt": "", "did": NSNull(), "bfont": "", "bsize": 0
+            ]],
+            "flds": fields,
+            "css": cardCSS,
+            "latexPre": "\\documentclass[12pt]{article}\n\\special{papersize=3in,5in}\n\\usepackage[utf8]{inputenc}\n\\usepackage{amssymb,amsmath}\n\\pagestyle{empty}\n\\setlength{\\parindent}{0in}\n\\begin{document}\n",
+            "latexPost": "\\end{document}",
+            "latexsvg": false,
+            "req": [[0, "any", [0]]],
             "tags": [],
             "vers": []
         ]

@@ -250,6 +250,9 @@ struct SidebarView: View {
         Button("Reveal Library in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting([library.root])
         }
+        Divider()
+        Button("Open a Different Library…") { openLibraryPanel(state: state) }
+        Button("Close \(library.name)") { state.closeLibrary() }
     }
 
     @ViewBuilder

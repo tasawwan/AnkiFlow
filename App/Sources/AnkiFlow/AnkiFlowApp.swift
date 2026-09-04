@@ -153,13 +153,24 @@ struct AnkiFlowApp: App {
         // masks, deleting a question -- had no undo at all. This one asks the
         // text field first and falls back to the app's own stack, which is what
         // ⌘U is expected to mean in both places.
+        // One Undo, two stacks. While the markup bar is up ⌘U takes back the
+        // last mark; the rest of the time it takes back the last thing you did
+        // to your questions. Two separate shortcuts would mean remembering
+        // which one you were in.
         CommandGroup(replacing: .undoRedo) {
-            Button(state.undoLabel.map { "Undo \($0)" } ?? "Undo") { state.undo() }
+            Button(state.isEditingPDF ? "Underline Text" : (state.undoLabel.map { "Undo \($0)" } ?? "Undo")) {
+                if state.isEditingPDF { state.toggleEditUnderline() } else { state.undo() }
+            }
                 .keyboardShortcut("u", modifiers: .command)
-                .disabled(!state.canUndo)
-            Button(state.redoLabel.map { "Redo \($0)" } ?? "Redo") { state.redo() }
-                .keyboardShortcut("u", modifiers: [.command, .shift])
+                .disabled(!state.isEditingPDF && !state.canUndo)
+            Button(state.redoLabel.map { "Redo \($0)" } ?? "Redo") {
+                if state.isEditingPDF { state.redoEdit() } else { state.redo() }
+            }
+                .keyboardShortcut("z", modifiers: [.command, .shift])
                 .disabled(!state.canRedo)
+            Button("Undo") { if state.isEditingPDF { state.undoEdit() } else { state.undo() } }
+                .keyboardShortcut("z", modifiers: .command)
+                .disabled(!state.canUndo)
         }
 
         // Find lives in Edit, where everyone already looks for it. It searches
@@ -198,6 +209,11 @@ struct AnkiFlowApp: App {
                 .keyboardShortcut("1", modifiers: .command)
             Button("Toggle Slide Gallery") { state.showThumbnails.toggle() }
                 .keyboardShortcut("2", modifiers: .command)
+            Button(state.showFlaggedPagesOnly ? "Show All Pages" : "Show Flagged Pages Only") {
+                state.toggleFlaggedPagesOnly()
+            }
+            .keyboardShortcut("3", modifiers: .command)
+            .disabled(state.document == nil || state.flaggedPages.isEmpty)
             Divider()
             Button("Next Page") { state.nextPage() }
                 .keyboardShortcut(.downArrow, modifiers: .command)
@@ -245,12 +261,50 @@ struct AnkiFlowApp: App {
 
             Divider()
 
-            Button("Add Written Answer") { state.revealBackField.toggle() }
-                .keyboardShortcut("b", modifiers: .command)
-
             Button("Delete Question") { state.deleteFocusedQuestion() }
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(state.focusedQID == nil)
+        }
+
+        // PDF -- the only menu in the app that writes to your lecture file.
+        // Kept separate from Question for exactly that reason: nothing in here
+        // is part of making a card, and nothing here happens by accident.
+        CommandMenu("PDF") {
+            Button(state.isEditingPDF ? "Stop Editing PDF" : "Edit PDF…") {
+                if state.isEditingPDF { state.stopEditingPDF() } else { state.startEditingPDF() }
+            }
+            .disabled(!state.canEditPDF)
+
+            Button("Save Marks into PDF") { state.savePDFEdits() }
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(!state.hasUnsavedPDFEdits)
+
+            Divider()
+
+            // Grouped, not laid out flat: a ViewBuilder takes at most ten
+            // children, and this menu has more than that.
+            Group {
+                Button("Highlight") { state.applyTextMarkTool(.highlight) }
+                Button("Underline") { state.applyTextMarkTool(.underline) }
+                Button("Strike Through") { state.applyTextMarkTool(.strikeOut) }
+                Button("Delete Selected Mark") { state.deleteSelectedMark() }
+                Button("Bold Text") { state.toggleEditBold() }
+                    .keyboardShortcut("b", modifiers: .command)
+                Button("Italicize Text") { state.toggleEditItalic() }
+                    .keyboardShortcut("i", modifiers: .command)
+            }
+            .disabled(!state.isEditingPDF)
+
+            Divider()
+
+            Group {
+                Button("Rotate Slide Right") { state.rotateCurrentPage(by: 90) }
+                Button("Rotate Slide Left") { state.rotateCurrentPage(by: -90) }
+                Button("Insert Slides…") { insertPagesPanel(state: state) }
+                Button("Delete This Slide…") { state.confirmingPageDelete = true }
+                Button("Trim Every Slide Like This One") { state.trimAllSlidesLikeThisOne() }
+            }
+            .disabled(!state.canEditPDF)
         }
 
         CommandGroup(replacing: .help) {

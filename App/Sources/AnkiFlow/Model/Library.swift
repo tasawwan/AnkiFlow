@@ -99,10 +99,26 @@ struct LibrarySettings: Codable, Equatable {
 
     /// Never empty, and never containing "::" -- that separates deck levels.
     var resolvedDeckRoot: String {
-        let cleaned = deckRoot
+        LibrarySettings.sanitisedDeckRoot(deckRoot)
+    }
+
+    static func sanitisedDeckRoot(_ raw: String) -> String {
+        let cleaned = raw
             .replacingOccurrences(of: "::", with: "-")
             .trimmingCharacters(in: .whitespaces)
         return cleaned.isEmpty ? AnkiIdentity.deckRoot : cleaned
+    }
+
+    /// What a brand-new library starts with: its own folder name.
+    ///
+    /// Applied only when there is no settings file yet. A library that has one
+    /// keeps whatever it says, even if that is the old "AnkiFlow" default --
+    /// changing an existing library's deck root would leave every card already
+    /// in Anki sitting under the old name, because Anki never moves existing
+    /// cards between decks on import. Splitting someone's collection in two is
+    /// not a thing to do on their behalf.
+    static func defaultDeckRoot(for root: URL) -> String {
+        sanitisedDeckRoot(root.lastPathComponent)
     }
 
     var pinnedTags: [TagDefinition] { tags.filter(\.pinned) }
@@ -150,7 +166,9 @@ final class Library: ObservableObject {
            let loaded = try? JSONDecoder().decode(LibrarySettings.self, from: data) {
             self.settings = loaded
         } else {
-            self.settings = LibrarySettings()
+            var fresh = LibrarySettings()
+            fresh.deckRoot = LibrarySettings.defaultDeckRoot(for: root)
+            self.settings = fresh
         }
         rescan()
     }
@@ -439,6 +457,20 @@ final class Library: ObservableObject {
     func adopt(_ orphan: OrphanRecovery.Orphan, pdfURL: URL) -> Bool {
         do {
             try OrphanRecovery.adopt(orphan, pdfURL: pdfURL)
+        } catch {
+            return false
+        }
+        rescan()
+        return true
+    }
+
+    /// Moves an orphaned question file to the macOS Trash, then rescans the
+    /// library so it is removed from recovery.
+    @discardableResult
+    func trashOrphan(_ orphan: OrphanRecovery.Orphan) -> Bool {
+        do {
+            var destination: NSURL?
+            try FileManager.default.trashItem(at: orphan.sidecarURL, resultingItemURL: &destination)
         } catch {
             return false
         }

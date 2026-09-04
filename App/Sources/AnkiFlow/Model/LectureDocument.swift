@@ -301,16 +301,121 @@ final class LectureDocument: ObservableObject {
     }
 
     /// Applies the mapping the user settled on.
+    ///
+    /// Removal happens **before** the remap, and the order is not incidental.
+    /// `removed` is a list of *old* page numbers, and the mapping deliberately
+    /// leaves those numbers out so surviving pages can fall through to their own
+    /// number. Renumber first and the old number now belongs to whichever slide
+    /// moved up into it -- so deleting slide 3 stripped slide 4 out of every
+    /// question that cited it, and left the question that cited slide 3 alone.
     func applyPageShift(_ mapping: [Int: Int], removing removed: [Int] = []) {
         for index in questions.indices {
+            for page in removed { dropPage(page, fromQuestionAt: index) }
             questions[index].remapPages(mapping)
-            for page in removed { questions[index].removePage(page) }
             questions[index].pruneCrops()
         }
         pendingShift = nil
         notice = "Slide numbers updated to match the new PDF."
         saveNow()
     }
+
+    // MARK: - Editing the PDF itself
+
+    /// Save an edit made to the lecture PDF, and bring the questions with it.
+    ///
+    /// This is the counterpart to `detectPageShift`. That one exists because a
+    /// PDF edited in another app arrives with no explanation and the app has to
+    /// infer what moved. Here the app *made* the change, so the mapping is exact:
+    /// questions are renumbered outright, with nothing to confirm and no notice
+    /// to dismiss.
+    ///
+    /// Three things have to happen together or the next launch looks like
+    /// somebody tampered with the file:
+    ///
+    /// 1. The document is written to disk.
+    /// 2. The recorded hash and sketches are refreshed, so the file's new state
+    ///    *is* the remembered state and no "this has changed" notice fires.
+    /// 3. Questions follow the pages -- renumbered, dropped, or with their crops
+    ///    re-expressed against a new page box.
+    func applyPDFEdit(_ change: PDFEditing.Change) throws {
+        guard let document else { return }
+        try PDFEditing.save(document, to: pdfURL)
+
+        // Order matters, and it is the reverse of the obvious one.
+        //
+        // `removed` is in the numbering *before* the edit and `boxChanges` is in
+        // the numbering *after* it, so the questions have to be walked through
+        // three stages: drop the pages that are gone while their old numbers
+        // still mean something, renumber what is left, and only then convert
+        // crops against boxes keyed by the new numbers.
+        for index in questions.indices {
+            for page in change.removed { dropPage(page, fromQuestionAt: index) }
+        }
+        if !change.remap.isEmpty {
+            for index in questions.indices { questions[index].remapPages(change.remap) }
+        }
+        for index in questions.indices {
+            for (page, boxes) in change.boxChanges {
+                if let crop = questions[index].questionCrops[page] {
+                    questions[index].questionCrops[page] = crop.converted(from: boxes.old, to: boxes.new)
+                }
+                if let crop = questions[index].answerCrops[page] {
+                    questions[index].answerCrops[page] = crop.converted(from: boxes.old, to: boxes.new)
+                }
+                // Masks belong to one slide, and that slide is the question's
+                // occlusion page.
+                if questions[index].occlusionPage == page {
+                    for maskIndex in questions[index].masks.indices {
+                        questions[index].masks[maskIndex].rect =
+                            questions[index].masks[maskIndex].rect.converted(from: boxes.old, to: boxes.new)
+                    }
+                }
+            }
+        }
+        if change.touchesNumbering {
+            for index in questions.indices { questions[index].pruneCrops() }
+        }
+
+        // Reloaded from disk only when pages moved. That is the case where the
+        // in-memory document and the questions have to be re-read together, and
+        // `pageCount` publishing the change is what gets the new document onto
+        // the screen. For a pen stroke or a trim the live document already *is*
+        // what was written, and re-parsing a 200-page lecture on every stroke
+        // would throw away the scroll position for nothing.
+        if change.touchesNumbering {
+            self.document = PDFDocument(url: pdfURL)
+            pageCount = self.document?.pageCount ?? pageCount
+        }
+        pdfSha256 = Self.sha256OfFile(at: pdfURL)
+        pendingShift = nil
+        loadedPDFInfo = nil
+        notice = nil
+        saveNow()
+    }
+
+    /// Remove a slide from one question, retiring the cards that go with it.
+    ///
+    /// Deleting a mask by hand retires its card, and so does deleting a
+    /// question. Deleting the *slide* the masks were drawn on has to do the
+    /// same, or those cards stay in Anki with nothing here that remembers them
+    /// and nothing in the export sheet offering to clean them up.
+    ///
+    /// Takes an index and writes the question back rather than taking it
+    /// `inout`: `retire` is a method on this same object, and calling one while
+    /// holding an exclusive `inout` borrow of `questions` is the kind of thing
+    /// that works until it doesn't.
+    private func dropPage(_ page: Int, fromQuestionAt index: Int) {
+        var question = questions[index]
+        let dropped = question.removePage(page)
+        for maskID in dropped where question.childExports[maskID] != nil {
+            retire(qid: question.guid(variant: maskID))
+            question.childExports[maskID] = nil
+        }
+        questions[index] = question
+    }
+
+    /// The live document, for the edit menu to operate on.
+    var editableDocument: PDFDocument? { document }
 
     // MARK: - Editing
 

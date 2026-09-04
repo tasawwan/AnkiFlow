@@ -238,7 +238,7 @@ struct ExportSettings: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     } else {
-                        Text("Nothing exported yet, so this is free to change. Per library, so different courses can use different roots.")
+                        Text("Starts as this library's folder name, and nothing has been exported yet, so it is free to change. Per library, so different courses can use different roots.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -276,10 +276,10 @@ struct ExportSettings: View {
             }
 
             Section("Fixed for merging") {
-                LabeledContent("Note type", value: AnkiIdentity.noteTypeName)
+                LabeledContent("Note types", value: "\(AnkiIdentity.noteTypeName), \(AnkiIdentity.clozeNoteTypeName)")
                 LabeledContent("Sidecar files", value: ".\(AnkiIdentity.sidecarExtension)")
 
-                Text("These two are read-only on purpose — they are how Anki matches your cards on re-import. Changing either after a first export would orphan every card you have studied, so there is no control here that can do it. The deck root above is safe by comparison: it changes where cards are filed, not whether they are recognised.")
+                Text("These are read-only on purpose — they are how Anki matches your cards on re-import. Changing either after a first export would orphan every card you have studied, so there is no control here that can do it. The deck root above is safe by comparison: it changes where cards are filed, not whether they are recognised.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

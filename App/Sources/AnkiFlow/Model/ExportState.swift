@@ -50,6 +50,10 @@ struct ExportSummary {
     var changedNotes: Int = 0
     var unchangedNotes: Int = 0
     var mediaFiles: Int = 0
+    /// Cloze questions left behind because their text has no {{cN::}} in it
+    /// yet. Reported rather than silently dropped: the note would have imported
+    /// and then been invisible, which is a much worse way to find out.
+    var skippedCloze: Int = 0
     var packageURL: URL?
 
     /// Questions removed from a lecture since it was last exported. Anki will
@@ -66,7 +70,7 @@ struct ExportSummary {
         // QID:"value" -- the value is quoted, not the whole term, or Anki reads
         // it as a search for literal text rather than as a field match.
         let clause = retired.map { "QID:\"\($0.qid)\"" }.joined(separator: " OR ")
-        return "\"note:\(AnkiIdentity.noteTypeName)\" (\(clause))"
+        return "\(AnkiIdentity.noteTypeScope) (\(clause))"
     }
 
     /// Selects the cards that should be moved, then use Change Deck.
@@ -82,6 +86,6 @@ struct ExportSummary {
 
     static func moveSearch(to deck: String) -> String {
         let tag = deck.replacingOccurrences(of: " ", with: "-")
-        return "\"note:\(AnkiIdentity.noteTypeName)\" \"tag:\(tag)\" -\"deck:\(deck)\""
+        return "\(AnkiIdentity.noteTypeScope) \"tag:\(tag)\" -\"deck:\(deck)\""
     }
 }

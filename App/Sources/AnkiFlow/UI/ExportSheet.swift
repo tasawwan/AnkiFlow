@@ -210,6 +210,19 @@ struct ExportSheet: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
+            if summary.skippedCloze > 0 {
+                // The one thing the exporter leaves behind, so it is said out
+                // loud. A cloze note with no deletions imports into Anki and
+                // then never appears anywhere -- finding that out weeks later,
+                // mid-review, is the outcome this line exists to prevent.
+                Text(summary.skippedCloze == 1
+                     ? "One cloze question was left out: nothing in it is hidden yet, so Anki would make no cards from it."
+                     : "\(summary.skippedCloze) cloze questions were left out: nothing in them is hidden yet, so Anki would make no cards from them.")
+                    .font(.callout)
+                    .foregroundStyle(Theme.retired)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if !summary.moved.isEmpty {
                 disclosure(
                     title: "\(summary.moved.count) lecture\(summary.moved.count == 1 ? "" : "s") moved folder",

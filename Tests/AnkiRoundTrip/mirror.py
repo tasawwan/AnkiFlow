@@ -10,6 +10,8 @@ import hashlib, json, sqlite3, struct, time, zlib, os, shutil
 
 NOTETYPE_NAME = "AnkiFlow Note v1"
 NOTETYPE_ID   = 2094605586
+CLOZE_NAME    = "AnkiFlow Cloze v1"
+CLOZE_ID      = 1313277180
 FIELDS        = ["Front", "FrontMedia", "Back", "BackMedia", "Extra", "Source", "QID"]
 DECK_ROOT     = "AnkiFlow"
 
@@ -18,6 +20,13 @@ CARD_CSS = ".card { font-family: -apple-system, sans-serif; }"
 FRONT_TMPL = '<div class="q">{{Front}}</div>\n{{FrontMedia}}'
 BACK_TMPL  = ('{{FrontSide}}\n<hr id="answer">\n<div class="a">{{Back}}</div>\n'
               '{{BackMedia}}\n<div class="src">{{Source}}</div>')
+
+# Cloze repeats the text rather than using {{FrontSide}}: on a cloze card
+# {{FrontSide}} keeps the deletion hidden, so the answer would never show.
+CLOZE_FRONT_TMPL = '<div class="q">{{cloze:Front}}</div>\n{{FrontMedia}}'
+CLOZE_BACK_TMPL  = ('<div class="q">{{cloze:Front}}</div>\n{{FrontMedia}}\n'
+                    '{{#Back}}<hr id="answer"><div class="a">{{Back}}</div>{{/Back}}\n'
+                    '{{BackMedia}}\n<div class="src">{{Source}}</div>')
 
 
 # ---------------------------------------------------------------- ZipWriter
@@ -94,6 +103,19 @@ def masks_fingerprint(masks):
     return ";".join(f'{m["id"]}:{crop_fingerprint(m["rect"])}' for m in masks)
 
 
+CLOZE_RE = None
+
+
+def cloze_ordinals(text):
+    """Mirrors Cloze.ordinals -- the distinct {{cN::}} numbers, ascending.
+    This is exactly the set of cards Anki generates."""
+    global CLOZE_RE
+    import re
+    if CLOZE_RE is None:
+        CLOZE_RE = re.compile(r"\{\{c(\d+)::(.*?)(?:::(.*?))?\}\}", re.S)
+    return sorted({int(m.group(1)) for m in CLOZE_RE.finditer(text) if int(m.group(1)) > 0})
+
+
 def note_variants(q):
     """Mirrors Question.noteVariants. One note, unless a separate-mode occlusion
     question, which makes one per mask."""
@@ -108,18 +130,27 @@ def guid_for(q, variant):
 
 
 def mask_paint_fingerprint(hidden, target, outlined):
-    """Mirrors PageRenderer.MaskPaint.fingerprint."""
+    """Mirrors PageRenderer.MaskPaint.fingerprint. `outlined` is a list; none
+    and one produce exactly the strings the single-rect version produced, so
+    cards that were already right keep their filenames."""
     parts = [crop_fingerprint(c) for c in hidden]
     parts.append("t" + (crop_fingerprint(target) if target else "-"))
-    parts.append("o" + (crop_fingerprint(outlined) if outlined else "-"))
+    parts.append("o" + ("+".join(crop_fingerprint(c) for c in outlined) if outlined else "-"))
     return hashlib.sha256(",".join(parts).encode()).hexdigest()[:10]
+
+
+def mask_paint_is_empty(hidden, target, outlined):
+    return not hidden and target is None and not outlined
 
 
 def occlusion_media_name(sha, page, crop, hidden, target, outlined):
     part = ""
     if crop is not None and not is_full_page(crop):
         part = "_c" + crop_fingerprint(crop)
-    part += "_m" + mask_paint_fingerprint(hidden, target, outlined)
+    # An empty paint adds nothing, exactly as the renderer skips `_m` when the
+    # MaskPaint is empty -- so a bare page keeps the plain filename.
+    if not mask_paint_is_empty(hidden, target, outlined):
+        part += "_m" + mask_paint_fingerprint(hidden, target, outlined)
     return f"af_{sha[:8]}_p{page:04d}{part}_w1600.jpg"
 
 
@@ -137,6 +168,13 @@ def content_hash(q, render_version=1, template_fingerprint=None, pdf_fingerprint
         variant,
         ",".join(sorted(q.get("tags", []))),
     ]
+    # A revision scoped to one kind of card -- see Question.contentHash. The
+    # all-at-once answer gained boxes around the regions it covered, and only
+    # those cards should re-render.
+    if (q["kind"] == "occlusion"
+            and q.get("occlusionMode", "separate") == "allAtOnce"
+            and q.get("masks")):
+        parts.append("allAtOnce-r2")
     for k in sorted(q.get("blanks", {})):
         parts.append(f"{k}={q['blanks'][k]}")
     if template_fingerprint:
@@ -233,6 +271,23 @@ def note_type_json():
     }
 
 
+def cloze_note_type_json():
+    """Same seven fields in the same order; type 1 is what makes it cloze."""
+    flds = [{"name": n, "ord": i, "sticky": False, "rtl": False,
+             "font": "Helvetica", "size": 20, "media": []} for i, n in enumerate(FIELDS)]
+    return {
+        "id": str(CLOZE_ID), "name": CLOZE_NAME, "type": 1,
+        "mod": int(time.time()), "usn": -1, "sortf": 0, "did": 1,
+        "tmpls": [{"name": "Cloze", "ord": 0, "qfmt": CLOZE_FRONT_TMPL,
+                   "afmt": CLOZE_BACK_TMPL, "bqfmt": "", "bafmt": "", "did": None,
+                   "bfont": "", "bsize": 0}],
+        "flds": flds, "css": CARD_CSS,
+        "latexPre": "\\documentclass[12pt]{article}\n\\begin{document}\n",
+        "latexPost": "\\end{document}", "latexsvg": False,
+        "req": [[0, "any", [0]]], "tags": [], "vers": [],
+    }
+
+
 def deck_json(did, name):
     return {"id": did, "name": name, "mod": int(time.time()), "usn": -1,
             "collapsed": False, "desc": "", "dyn": 0, "conf": 1,
@@ -266,6 +321,9 @@ def export(plans, destination, export_state, media_source, now=None):
     decks = {"1": deck_json(1, "Default")}
     media_files = {}
     note_counter = int(time.time() * 1000)
+    # Cards get their own counter: a cloze note makes several, so "nid + 1"
+    # would collide with the next note's card.
+    card_counter = note_counter
     card_position = 0
     summary = dict(new=0, changed=0, unchanged=0, moved=[], retired=[])
     seen = set()
@@ -275,6 +333,11 @@ def export(plans, destination, export_state, media_source, now=None):
         decks[str(did)] = deck_json(did, plan["deckName"])
 
         for q in plan["questions"]:
+          # A cloze note with no deletions makes no cards in Anki, so it would
+          # import and then be invisible. Skipped, like the Swift does.
+          if q["kind"] == "cloze" and not cloze_ordinals(q.get("front", "")):
+              summary["skipped_cloze"] = summary.get("skipped_cloze", 0) + 1
+              continue
           for variant, mask in note_variants(q):
             guid = guid_for(q, variant)
             seen.add(guid)
@@ -304,10 +367,13 @@ def export(plans, destination, export_state, media_source, now=None):
                 others = [m["rect"] for m in q.get("masks", [])
                           if mask is None or m["id"] != mask["id"]]
                 target = mask["rect"] if mask else None
-                n = occlusion_media_name(plan["sha"], page, crop, others, target, None)
+                n = occlusion_media_name(plan["sha"], page, crop, others, target, [])
                 media_files[n] = media_source
                 front_imgs.append(n)
-                n = occlusion_media_name(plan["sha"], page, crop, [], None, target)
+                # The back boxes what was covered: the one region on a
+                # per-region card, all of them on an all-at-once card.
+                revealed = [target] if target else [m["rect"] for m in q.get("masks", [])]
+                n = occlusion_media_name(plan["sha"], page, crop, [], None, revealed)
                 media_files[n] = media_source
                 back_imgs.append(n)
             else:
@@ -334,17 +400,25 @@ def export(plans, destination, export_state, media_source, now=None):
 
             note_counter += 1
             nid = note_counter
+            mid = CLOZE_ID if q["kind"] == "cloze" else NOTETYPE_ID
             db.execute(
                 "INSERT INTO notes (id,guid,mid,mod,usn,tags,flds,sfld,csum,flags,data) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (nid, guid, NOTETYPE_ID, mod, -1, tag_str,
+                (nid, guid, mid, mod, -1, tag_str,
                  "\x1f".join(flds), sort_field, checksum(sort_field), 0, ""))
-            card_position += 1
-            db.execute(
-                "INSERT INTO cards (id,nid,did,ord,mod,usn,type,queue,due,ivl,factor,"
-                "reps,lapses,left,odue,odid,flags,data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (nid + 1, nid, did, 0, mod, -1, 0, 0, card_position,
-                 0, 0, 0, 0, 0, 0, 0, 0, ""))
+
+            # One card per cloze ordinal; one card, ord 0, for everything else.
+            ords = ([n - 1 for n in cloze_ordinals(q.get("front", ""))]
+                    if q["kind"] == "cloze" else [0])
+            for o in ords:
+                card_counter += 1
+                card_position += 1
+                db.execute(
+                    "INSERT INTO cards (id,nid,did,ord,mod,usn,type,queue,due,ivl,factor,"
+                    "reps,lapses,left,odue,odid,flags,data) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (card_counter, nid, did, o, mod, -1, 0, 0, card_position,
+                     0, 0, 0, 0, 0, 0, 0, 0, ""))
 
             if guid in export_state and export_state[guid] != plan["deckName"]:
                 summary["moved"].append((guid, export_state[guid], plan["deckName"]))
@@ -361,7 +435,8 @@ def export(plans, destination, export_state, media_source, now=None):
                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (1, t, t * 1000, t * 1000 - 100, 11, 0, 0, 0,
                 json.dumps(conf, sort_keys=True),
-                json.dumps({str(NOTETYPE_ID): note_type_json()}, sort_keys=True),
+                json.dumps({str(NOTETYPE_ID): note_type_json(),
+                            str(CLOZE_ID): cloze_note_type_json()}, sort_keys=True),
                 json.dumps(decks, sort_keys=True),
                 json.dumps(deck_config(), sort_keys=True), "{}"))
     db.commit()
