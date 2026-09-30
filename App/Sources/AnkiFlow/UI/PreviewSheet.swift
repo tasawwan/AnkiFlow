@@ -26,7 +26,7 @@ struct PreviewSheet: View {
     /// focused — which is why none of the keys did anything.
     @FocusState private var keyboard: Bool
 
-    init(settings: LibrarySettings, cacheDirectory: URL) {
+    init(settings: AppSettings, cacheDirectory: URL) {
         _session = StateObject(wrappedValue: PreviewSession(settings: settings,
                                                             cacheDirectory: cacheDirectory))
     }
@@ -173,9 +173,22 @@ struct PreviewSheet: View {
                     if item.question.kind == .cloze {
                         clozeCardBody(item, revealed: session.revealed)
                     } else {
-                        side(item, back: false)
+                        // An occlusion card's two sides are the same slide, once
+                        // covered and once not. Drawing both after the reveal
+                        // leaves the covered copy sitting on top of its own
+                        // answer -- so on reveal the front gives up its image
+                        // and the uncovered slide takes its place. Its prompt
+                        // and "region 2 of 5" stay, because those are the
+                        // question and the question does not go away.
+                        let swapsImage = item.question.kind == .occlusion && session.revealed
+                        let keepsFront = !swapsImage || hasFrontText(item) || item.ordinal != nil
+                        if keepsFront {
+                            side(item, back: false, showsImages: !swapsImage)
+                        }
                         if session.revealed {
-                            Rectangle().fill(palette.line).frame(height: 1)
+                            if keepsFront {
+                                Rectangle().fill(palette.line).frame(height: 1)
+                            }
                             side(item, back: true)
                         } else {
                             showAnswerButton
@@ -321,8 +334,14 @@ struct PreviewSheet: View {
 
     // MARK: - One side of one card
 
+    private func hasFrontText(_ item: PreviewSession.Item) -> Bool {
+        !session.text(for: item, templates: state.templates.templates).front
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     @ViewBuilder
-    private func side(_ item: PreviewSession.Item, back: Bool) -> some View {
+    private func side(_ item: PreviewSession.Item, back: Bool,
+                      showsImages: Bool = true) -> some View {
         let text = session.text(for: item, templates: state.templates.templates)
         let composition = session.composition(for: item)
         let body = back ? text.back : text.front
@@ -341,7 +360,9 @@ struct PreviewSheet: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(palette.dim)
             }
-            slideImages(for: specs, in: item.pdfURL)
+            if showsImages {
+                slideImages(for: specs, in: item.pdfURL)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

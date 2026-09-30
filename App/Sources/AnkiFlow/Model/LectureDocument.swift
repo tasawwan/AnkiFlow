@@ -26,6 +26,14 @@ struct SidecarFile: Codable {
     /// The deck this lecture last exported to. If the lecture has since moved
     /// folders, this is how we know.
     var lastExportedDeckName: String?
+    /// You have decided this lecture is learned.
+    ///
+    /// In the sidecar rather than the notes file because it is a fact about
+    /// your progress, not a line of your writing -- the notes file is yours and
+    /// nothing but what you typed belongs in it. It overrules everything the
+    /// app can work out on its own: Anki knowing about every card is evidence,
+    /// and you saying so is the answer.
+    var reviewed: Bool?
     /// Questions that were exported and have since been deleted. Anki has no
     /// concept of an upstream deletion, so their cards are still sitting in
     /// your collection and we have to be able to name them.
@@ -55,6 +63,11 @@ final class LectureDocument: ObservableObject {
     @Published private(set) var loadError: String?
     /// Set when questions were recovered from a sidecar left behind by a move.
     @Published private(set) var notice: String?
+
+    /// Read and understood. The notice says what changed about the PDF since you
+    /// last worked on it, which is worth reading once and not worth keeping on
+    /// screen for the rest of the session.
+    func dismissNotice() { notice = nil }
     /// Set when the PDF's pages have moved under the questions. Held rather than
     /// applied: renumbering somebody's whole question bank is not something to
     /// do without asking, and the alternative -- doing nothing -- is worse.
@@ -67,13 +80,14 @@ final class LectureDocument: ObservableObject {
     private(set) var pdfSha256: String = ""
     private(set) var deckNameOverride: String?
     @Published private(set) var lastExportedDeckName: String?
+    @Published private(set) var reviewed = false
     @Published private(set) var retiredQIDs: [String] = []
     private(set) var document: PDFDocument?
 
     private var saveTask: Task<Void, Never>?
     private var loadedFileDate: Date?
 
-    var title: String { pdfURL.deletingPathExtension().lastPathComponent }
+    var title: String { pdfURL.lectureName }
 
     init(pdfURL: URL, libraryRoot: URL? = nil) {
         self.pdfURL = pdfURL
@@ -88,6 +102,8 @@ final class LectureDocument: ObservableObject {
 
     private func load() {
         document = PDFDocument(url: pdfURL)
+        // Highlights are drawn by us from here on -- see PDFEditing.
+        PDFEditing.takeOverHighlights(in: document)
         pageCount = document?.pageCount ?? 0
         pdfSha256 = Self.sha256OfFile(at: pdfURL)
 
@@ -107,10 +123,21 @@ final class LectureDocument: ObservableObject {
             questions = file.questions
             deckNameOverride = file.deckNameOverride
             lastExportedDeckName = file.lastExportedDeckName
+            reviewed = file.reviewed ?? false
             retiredQIDs = file.retiredQIDs ?? []
             loadedPDFInfo = file.pdf
             loadedFileDate = fileModificationDate()
             loadError = nil
+
+            // A question written under a card type this app no longer has was
+            // read as Basic. Write the file back now, in the current shape, so
+            // that reading happens once rather than on every open forever. The
+            // modification date was just taken, so this cannot trip the
+            // edited-underneath-us guard in `saveNow`.
+            if questions.contains(where: \.wasMigrated) {
+                for index in questions.indices { questions[index].wasMigrated = false }
+                saveNow()
+            }
 
             // The PDF was edited in place -- annotations added, say. The
             // questions still point at the right page numbers, but every slide
@@ -125,9 +152,9 @@ final class LectureDocument: ObservableObject {
 
             if !file.pdf.sha256.isEmpty, file.pdf.sha256 != pdfSha256, pendingShift == nil {
                 if file.pdf.pageCount == pageCount {
-                    notice = "\(pdfURL.lastPathComponent) has changed since you last worked on it — same \(pageCount) pages, so your questions still line up. Slides will re-render on the next export."
+                    notice = "\(pdfURL.finderName) has changed since you last worked on it — same \(pageCount) pages, so your questions still line up. Slides will re-render on the next export."
                 } else {
-                    notice = "\(pdfURL.lastPathComponent) has changed and now has \(pageCount) pages instead of \(file.pdf.pageCount). Nothing your questions point at seems to have moved, but it's worth a look."
+                    notice = "\(pdfURL.finderName) has changed and now has \(pageCount) pages instead of \(file.pdf.pageCount). Nothing your questions point at seems to have moved, but it's worth a look."
                 }
                 saveNow()
             }
@@ -167,6 +194,22 @@ final class LectureDocument: ObservableObject {
         guard loadError == nil else { return }
         saveTask?.cancel()
         saveTask = nil
+
+        // Never *create* a question file for a lecture that is not there.
+        //
+        // Renaming or moving a lecture takes its question file with it, and the
+        // still-open document -- which is holding the old path -- is then asked
+        // to save on its way out. Writing at that moment puts a fresh sidecar
+        // back at a name with no PDF beside it: an orphan the app made itself,
+        // out of a rename that had worked perfectly.
+        //
+        // An existing file is still written. A PDF that disappeared from under
+        // an open lecture -- renamed in the Finder, moved by a sync -- leaves
+        // its question file behind, and that one has to go on taking your edits
+        // or the questions you just typed are the thing that gets lost.
+        let manager = FileManager.default
+        guard manager.fileExists(atPath: pdfURL.path)
+                || manager.fileExists(atPath: sidecarURL.path) else { return }
 
         // Someone edited the file underneath us. Keep ours, park theirs beside it.
         if let loadedFileDate, let onDisk = fileModificationDate(), onDisk > loadedFileDate.addingTimeInterval(0.5) {
@@ -210,8 +253,18 @@ final class LectureDocument: ObservableObject {
                         pageFingerprints: nil,
                         pageSketches: currentSketches()),
             deckNameOverride: deckNameOverride,
-            questions: questions,
+            // Empty ones never reach the file.
+            //
+            // Opening a template's tab gives you its shape to type into, and
+            // that shape is a view: until there are words in it there is no
+            // card, and writing one would leave a blank entry in your question
+            // file for every tab you looked at. It is filtered here rather than
+            // refused earlier so the card you are part-way through still exists
+            // in memory to be typed into -- it simply is not yours until it
+            // says something.
+            questions: questions.filter { !$0.isEmpty },
             lastExportedDeckName: lastExportedDeckName,
+            reviewed: reviewed ? true : nil,
             retiredQIDs: retiredQIDs.isEmpty ? nil : retiredQIDs
         )
         let encoder = JSONEncoder()
@@ -220,30 +273,10 @@ final class LectureDocument: ObservableObject {
         guard let data = try? encoder.encode(file) else { return }
         do {
             try AtomicWrite.write(data, to: sidecarURL, hidden: hideFile)
-            writeSnapshot(data)
             lastSavedAt = Date()
             loadedFileDate = fileModificationDate()
         } catch {
             loadError = "Could not save: \(error.localizedDescription)"
-        }
-    }
-
-    /// A timestamped copy per save, pruned to the last 20. A few KB each.
-    private func writeSnapshot(_ data: Data) {
-        guard let historyDir = LibraryPaths.historyDirectory(forSidecar: sidecarURL) else { return }
-        try? FileManager.default.createDirectory(at: historyDir, withIntermediateDirectories: true)
-        let stamp = ISO8601DateFormatter().string(from: Date())
-            .replacingOccurrences(of: ":", with: "-")
-        let name = "\(pdfURL.deletingPathExtension().lastPathComponent)__\(stamp).json"
-        try? data.write(to: historyDir.appendingPathComponent(name))
-
-        let existing = ((try? FileManager.default.contentsOfDirectory(at: historyDir, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.lastPathComponent.hasPrefix(pdfURL.deletingPathExtension().lastPathComponent + "__") }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        if existing.count > 20 {
-            for url in existing.prefix(existing.count - 20) {
-                try? FileManager.default.removeItem(at: url)
-            }
         }
     }
 
@@ -264,6 +297,145 @@ final class LectureDocument: ObservableObject {
     /// question bank on a guess is worse than the bug it fixes, and the slides
     /// that can't be matched by text are exactly the ones a person should look
     /// at — so those are surfaced with their reasoning rather than applied.
+    /// Re-reads the PDF because the file on disk changed underneath us.
+    ///
+    /// For the lecture you annotated somewhere else and let sync back: a file
+    /// AnkiFlow did not write, arriving while it is open. The sketches of the
+    /// document being replaced are taken *before* the swap, so the same
+    /// machinery that catches a slide inserted between sessions catches one
+    /// inserted while you were looking at it -- and your questions are offered
+    /// the shift rather than quietly pointing a slide too early.
+    ///
+    /// Returns false, changing nothing, if the file cannot be parsed. A cloud
+    /// folder writes a file in pieces, so "half a PDF" is a state you will
+    /// genuinely see, and replacing a working document with it would be worse
+    /// than waiting for the next write.
+    /// What a reload could not carry across, for the app to say out loud.
+    struct ReplayResult {
+        var replayed = 0
+        var stranded = 0
+        /// Everything an open editing session needs to carry on against the
+        /// document that has just replaced the one it was holding. Nil when a
+        /// mark could not be brought across as itself, which is the one case
+        /// where the session's undo history can no longer be trusted and has
+        /// to be thrown away instead.
+        var rebase: Rebase?
+    }
+
+    /// The handover from the replaced document to its replacement.
+    struct Rebase {
+        let document: PDFDocument
+        let moves: [(old: PDFPage, new: PDFPage)]
+        let baseline: PDFEditSession.Baseline
+    }
+
+    private(set) var lastReplay = ReplayResult()
+
+    @discardableResult
+    func reloadPDFFromDisk(replaying pending: PDFEditSession.PendingMarks? = nil) -> Bool {
+        guard let fresh = PDFDocument(url: pdfURL), fresh.pageCount > 0 else { return false }
+        let before = SidecarFile.PDFInfo(fileName: pdfURL.lastPathComponent,
+                                         pageCount: pageCount,
+                                         sha256: pdfSha256,
+                                         pageFingerprints: nil,
+                                         pageSketches: currentSketches())
+        // Your unsaved marks, put back on top of the newer lecture.
+        //
+        // Mapped through the page sketches rather than by number: a slide added
+        // on the other device shifts everything after it, and replaying by
+        // index would put your highlight on the wrong slide -- silently, which
+        // is the worst way for this to be wrong.
+        lastReplay = ReplayResult()
+        if let pending {
+            // Snapshotted here, in the one moment it exists: the new file as it
+            // came off the disk, before any of your marks go back on top of it.
+            // That is what "unsaved work" will mean from now on.
+            let baseline = PDFEditSession.Baseline(of: fresh)
+            let mapping = PageSketch.align(old: before.pageSketches ?? [],
+                                           new: PageSketch.all(in: fresh))
+            var toNew: [Int: Int] = [:]
+            for move in mapping {
+                if let new = move.newPage { toNew[move.oldPage] = new }
+            }
+            // Straight through when the sketches had nothing to say -- an
+            // image-only lecture has no text to match on, and the page numbers
+            // are then the best evidence there is.
+            func target(for old: Int) -> PDFPage? {
+                guard let number = toNew[old] ?? (toNew.isEmpty ? old : nil),
+                      number >= 1, number <= fresh.pageCount else { return nil }
+                return fresh.page(at: number - 1)
+            }
+
+            // Every mark is *moved*, not copied, so that the undo steps holding
+            // it go on holding the right object. An annotation is listed by the
+            // page it sits on, which is why it has to come off the old one
+            // before it can go on the new.
+            var identityHeld = true
+            for entry in pending.added {
+                guard let page = target(for: entry.page) else {
+                    // Nowhere to put it. The step that made it still points at a
+                    // page this document does not have, so undoing it finds
+                    // nothing and changes nothing -- which is right.
+                    lastReplay.stranded += 1
+                    continue
+                }
+                entry.annotation.page?.removeAnnotation(entry.annotation)
+                page.addAnnotation(entry.annotation)
+                if page.annotations.contains(where: { $0 === entry.annotation }) {
+                    lastReplay.replayed += 1
+                } else if let copy = PDFEditing.copy(entry.annotation) {
+                    // PDFKit would not take the object across. The mark is kept
+                    // -- losing your markup is the one unacceptable outcome --
+                    // but it is no longer the object the history holds, so the
+                    // history goes.
+                    page.addAnnotation(copy)
+                    lastReplay.replayed += 1
+                    identityHeld = false
+                } else {
+                    lastReplay.stranded += 1
+                    identityHeld = false
+                }
+            }
+
+            // Marks you deleted go on being deleted. Matched on kind and place
+            // because the object itself belongs to the document being replaced.
+            for entry in pending.removed {
+                guard let page = target(for: entry.page) else { continue }
+                let match = page.annotations.first {
+                    ($0.type ?? "") == entry.type
+                        && abs($0.bounds.midX - entry.bounds.midX) < 1
+                        && abs($0.bounds.midY - entry.bounds.midY) < 1
+                }
+                if let match { page.removeAnnotation(match) }
+            }
+
+            // Where every page went, not only the marked ones: a step can refer
+            // to a page whose marks are all exactly as they were on disk -- a
+            // deletion you have already undone, say -- and redoing it still has
+            // to reach the right slide.
+            if identityHeld, let old = document {
+                var moves: [(old: PDFPage, new: PDFPage)] = []
+                for number in 1...max(old.pageCount, 1) {
+                    guard let from = old.page(at: number - 1),
+                          let to = target(for: number) else { continue }
+                    moves.append((old: from, new: to))
+                }
+                lastReplay.rebase = Rebase(document: fresh, moves: moves,
+                                           baseline: baseline)
+            }
+        }
+
+        document = fresh
+        PDFEditing.takeOverHighlights(in: fresh)
+        pageCount = fresh.pageCount
+        pdfSha256 = Self.sha256OfFile(at: pdfURL)
+        detectPageShift(against: before)
+        // Slide images come from the hash, so the new hash is what makes the
+        // re-rendered pictures reach your cards on the next export.
+        saveNow()
+        return true
+    }
+
     private func detectPageShift(against info: SidecarFile.PDFInfo) {
         pendingShift = nil
         guard let document else { return }
@@ -337,8 +509,32 @@ final class LectureDocument: ObservableObject {
     ///    *is* the remembered state and no "this has changed" notice fires.
     /// 3. Questions follow the pages -- renumbered, dropped, or with their crops
     ///    re-expressed against a new page box.
+    /// Raised instead of overwriting a lecture that changed underneath us.
+    struct StaleWrite: LocalizedError {
+        let fileName: String
+        var errorDescription: String? {
+            "\(fileName) changed on disk since it was opened — probably synced back from another device. Nothing was written. Let it reload, then save again."
+        }
+    }
+
     func applyPDFEdit(_ change: PDFEditing.Change) throws {
         guard let document else { return }
+        // Never write over a newer file.
+        //
+        // Every write to the PDF is something you asked for -- ⌘S, a page move,
+        // a flag -- so the app is not editing your lecture behind your back.
+        // But "you asked for it" is not enough on its own: if the iPad's copy
+        // landed a second ago, saving would put the version this app has been
+        // holding on top of it and lose whatever you did over there. The hash
+        // taken at load is what says whether that has happened.
+        if !pdfSha256.isEmpty, Self.sha256OfFile(at: pdfURL) != pdfSha256 {
+            throw StaleWrite(fileName: pdfURL.lastPathComponent)
+        }
+        // Pasted pictures become part of the page on the way out, so once they
+        // are written the live document and the file no longer agree: the file
+        // has the picture in its content, the document still has the stamp that
+        // drew it. Saving again from here would write the same picture twice.
+        let burnedPictures = PDFEditing.hasImageStamps(document)
         try PDFEditing.save(document, to: pdfURL)
 
         // Order matters, and it is the reverse of the obvious one.
@@ -382,8 +578,9 @@ final class LectureDocument: ObservableObject {
         // the screen. For a pen stroke or a trim the live document already *is*
         // what was written, and re-parsing a 200-page lecture on every stroke
         // would throw away the scroll position for nothing.
-        if change.touchesNumbering {
+        if change.touchesNumbering || burnedPictures {
             self.document = PDFDocument(url: pdfURL)
+            PDFEditing.takeOverHighlights(in: self.document)
             pageCount = self.document?.pageCount ?? pageCount
         }
         pdfSha256 = Self.sha256OfFile(at: pdfURL)
@@ -461,10 +658,63 @@ final class LectureDocument: ObservableObject {
         questions.removeAll { $0.qid == qid }
     }
 
+    /// Puts the questions in slide order, in the file.
+    ///
+    /// Sorted by the first slide on the question side, then the first on the
+    /// answer side -- which for a lecture you worked through front to back is
+    /// the order you wrote them in anyway, and for one you came back to is the
+    /// order you will read them in.
+    ///
+    /// A question with no slides does not move. It keeps the index it is at
+    /// while the anchored ones are sorted into the remaining positions around
+    /// it, so a written-only card stays next to the ones it was written beside
+    /// instead of being swept to the end where it means nothing. That is the
+    /// whole subtlety here: sorting a list that only some members have a key
+    /// for, without inventing a key for the rest.
+    ///
+    /// Returns true if anything moved.
+    @discardableResult
+    func sortQuestionsBySlides() -> Bool {
+        let anchored = questions.indices.filter { !questions[$0].allPages.isEmpty }
+        guard anchored.count > 1 else { return false }
+
+        let sorted = anchored.map { questions[$0] }.sorted { a, b in
+            let aq = a.questionPages.min() ?? Int.max
+            let bq = b.questionPages.min() ?? Int.max
+            if aq != bq { return aq < bq }
+            let aa = a.answerPages.min() ?? Int.max
+            let ba = b.answerPages.min() ?? Int.max
+            return aa < ba
+        }
+
+        var rebuilt = questions
+        for (slot, question) in zip(anchored, sorted) { rebuilt[slot] = question }
+        guard rebuilt.map(\.qid) != questions.map(\.qid) else { return false }
+        questions = rebuilt
+        saveNow()
+        return true
+    }
+
+    /// Removes a question without retiring it.
+    ///
+    /// For deletions that came *from* Anki. `delete(qid:)` records a tombstone
+    /// so the next export can offer to remove the card -- exactly wrong here,
+    /// where the card is already gone and the tombstone would offer to delete
+    /// something that does not exist.
+    func forget(qid: String) {
+        questions.removeAll { $0.qid == qid }
+    }
+
     /// Called after the export sheet has told you about them.
     func clearRetired() {
         guard !retiredQIDs.isEmpty else { return }
         retiredQIDs = []
+        saveNow()
+    }
+
+    func setReviewed(_ value: Bool) {
+        guard reviewed != value else { return }
+        reviewed = value
         saveNow()
     }
 

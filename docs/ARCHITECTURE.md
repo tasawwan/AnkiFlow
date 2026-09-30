@@ -117,18 +117,79 @@ A question carries `qid` (ULID), `type`, `front`, `back`, `blanks`, `questionPag
 
 **A lecture with no questions gets no file**, and empty files are swept away on every library scan. An empty question file next to a PDF looks exactly like questions someone has lost.
 
-### Per-library state — `.ankiflow/` at the library root
+### The notes file
+
+One per lecture, named after the PDF and sitting beside it: `Innate Immunity.pdf` gets `Innate Immunity Notes.md`. Not hidden — you are meant to open it in other things, and in a folder of them the name has to say what it is.
+
+Deliberately kept away from the question file. Questions have a merge contract with Anki to honour; a note is prose. Keeping them apart means a malformed note can never make a lecture's questions unreadable, and the note can be edited, synced or deleted by anything else without this app caring.
+
+`RichTextMarkdown` is the whole of the format decision, and the rule is: **if the format cannot say it, the editor does not offer it.** Headings, `**bold**`, `*italic*`, `~~strike~~`, `- ` lists and `[links](…)` are written as Markdown; underline is the one `<u>` tag every renderer honours.
+
+An earlier version also wrote colour, point size and typeface as inline `<span style="…">`. It round-tripped and it was wrong: the file filled with HTML only this app would have produced, and the reason notes live next to the PDFs as plain `.md` is that they should read well in Obsidian, on a phone, in TextEdit, in ten years. Making text bigger has a Markdown answer already — it is a heading. The toolbar was cut to match, because a button that silently loses formatting on save is worse than no button.
+
+Storing the whole note as HTML would round-trip perfectly for free, and was rejected for the same reason.
+
+Reading is hand-written rather than `NSAttributedString(markdown:)`, which discards the `<u>` tags — underline would be silently lost on every open.
+
+`LectureNotes` polls the file every two seconds, the same way `Library` watches its folder. The folder is the truth: an external edit is reloaded, and a file deleted in Finder empties the pane rather than being silently rewritten by the next autosave. The reload is signalled by a `reloadToken` rather than by the editor watching `text`, which changes on every keystroke — reloading the view from that would reset the caret with each character typed.
+
+The file holds three things, in this order: the topics block, the lecture-questions block, then the prose. Both blocks are fenced by HTML comments (`<!-- ankiflow:topics -->`, `<!-- ankiflow:questions -->`) — invisible in every rendered view of the Markdown, and unambiguous to find. They compose rather than nest: `TopicBlock.split` takes its block off the front and hands the rest to `QuestionBlock.split`, and `join` runs the other way round, so a file with neither block is exactly the prose.
+
+**The blocks never reach the editor.** `LectureNotes.text` is the prose alone; the blocks are split off on load and re-emitted on save. The panels are the editing surface for them, and the notes editor shows what you wrote and nothing else.
+
+A lecture question is a **draft card**: `text`, `answer`, `questionSlides`, `answerSlides`, `tags`, `answered`. Everything a `Question` has, held here rather than in the sidecar because it is not finished. Promotion maps it across whole and adds `AppState.promotedTag`, registering that tag in the library's list so it is filterable like any other.
+
+In the block, `Slides:` unqualified means the answer's — that is what it has always meant, so a notes file written before questions had a front row still reads correctly. The front row is `Question slides:`, and tags are `Tags:`.
+
+**Both are read forgivingly and written canonically.** A topic line with no rating parses as `low`; a bare line under a question is taken as that question's answer even without the `>` marker; slide lists accept `12, 14` or `12–14` in any case. `blockIsCanonical(in:)` then asks whether what is on disk is already exactly what this app would write, and if not schedules a tidy save — so a topic added by hand in VS Code is rated and sorted into place about a second later.
+
+That comparison is deliberately **block-only, never the prose.** `RichTextMarkdown` is not guaranteed byte-identical round-trip, and rewriting somebody's notes because a space moved would be exactly the silent edit that keeping notes as a plain file is meant to prevent.
+
+Topics are written sorted — weakest first, then alphabetically — because being readable in the Markdown is the whole reason they live there. Lecture questions are **not** auto-sorted: the order you asked them in is information. Neither list reorders when you rate or tick a row, because a row that moves out from under the cursor mid-click makes the panel unusable; both panels sort on demand from a button in their header.
+
+`LectureQuestion.slides` attaches to the *answer*, which is what makes promotion a straight mapping: question → front, answer → back, slides → answer stack, the shape a Basic card already has. `AppState.promoteLectureQuestions` moves rather than copies — the same question in two lists is two places to keep an answer in step. It builds the cards before recording anything so the undo step can carry their qids, which is what makes the move one action: a single ⌘Z removes the cards *and* puts the questions back, rather than the two halves coming back on separate presses from two different ledgers.
+
+### `AnkiIdentity.Companion`
+
+The list of what belongs to a lecture besides the PDF. Rename, move, trash and orphan recovery all iterate it. Adding a companion file anywhere else means finding all four of those call sites again and missing one.
+
+Note the shape of the iteration: each case builds **both** ends of a rename from the PDF's name, because the two companions are named by different rules — the question file appends an extension, the note file appends a word *and* an extension. Deriving a destination from the source URL instead is the bug this shape exists to prevent: `URL.pathExtension` on `Lecture 04.ankiflow.json` is `json`, so a destination rebuilt from it renames the question file to `New Name.json` and orphans every question in it.
+
+### Where state lives
 
 | | |
 |---|---|
-| `library.json` | Deck root, tag definitions, render settings, `renderVersion` |
+| `Application Support/AnkiFlow/Settings.json` | Deck root, tag definitions, render settings, `renderVersion` |
+| `Application Support/AnkiFlow/Templates.json` | Every template, built-ins included |
+| `~/Library/Caches/AnkiFlow/slides` | Rendered slide images. Safe to delete; regenerated on demand. |
+| `<lecture>.ankiflow.json` | That lecture's questions, beside its PDF |
+| `<lecture> Notes.md` | That lecture's notes, topics and lecture questions |
 
-`AnkiIdentity.deckRoot` is the fallback, not the default: a library with no `library.json` yet starts with its own folder name as the deck root. A library that already has one keeps whatever it says, because moving an existing deck root would leave every studied card behind in the old tree — Anki does not move cards between decks on import.
-| `cache/` | Rendered slide images. Safe to delete; regenerated on demand. |
-| `history/` | Save snapshots, last 20 per lecture |
-| `undo.json` | Library-wide undo and redo stacks |
+**Nothing is written inside a library any more.** Settings moved to `Application Support/AnkiFlow/Settings.json` (`SettingsStore`, a `@MainActor` singleton; `Library.settings` is a passthrough to it so `library.settings.x` still reads the same, and `Library` forwards its `objectWillChange` or nothing redraws). Rendered slide images moved to `~/Library/Caches/AnkiFlow/slides` — `AppPaths.cacheDirectory`, one cache for every library, which is safe because the media filenames already carry the PDF's own SHA-256 prefix. Save snapshots are gone entirely.
 
-Templates are **not** per library — they live in Application Support, so they follow you between courses.
+`LibraryPaths` survives for two jobs only: recognising a leftover `.ankiflow` folder so the library scan skips it, and reading its `library.json` once in `SettingsStore.adoptOldLibraryFile`. Everything but the deck root comes across in that read, because the deck root changed meaning.
+
+No undo history either: every stack in the app is session-scoped.
+
+**Deck names are `<root>::<library folder>::<folders>::<lecture>`.** The root is one app-level setting; the library's own name comes from its folder rather than being stored, which is what lets the app keep nothing per library. `resolvedDeckRoot` **may be empty**, meaning no level above the library — that is the escape hatch for someone whose cards were exported under the old scheme, where the root *was* the library name. Every caller has to guard for the empty case; the one that did not turned an interpolated `"\(root)::"` strip pattern into `"::"` and glued every level of a deck name into one word.
+
+Changing the root after an export splits the collection, because Anki does not move existing cards between decks on import. Settings earns its warning by counting questions with an `export` record.
+
+### Templates are a lens, not a card format
+
+Nothing about a template is written into a question file. A card made through one is an ordinary `kind: .basic` (or `.occlusion`, or `.cloze`) question holding its own finished `front` and `back`; `templateId` and `blanks` are legacy fields that only ever decode. The template's job is the inverse operation: `Template.recover(front:back:)` reads a rendered string back into the values that produced it, which is what puts a card in a template's tab and what fills the blank fields you edit it with.
+
+This is why deleting a template cannot damage a card, and it is the whole reason for the design. Under the old scheme the words on a card lived in the template file and the card held only the blanks — a card held hostage by a file it never mentioned, one Application Support wipe away from being blank. `AppState.adoptTemplateText()` converts any surviving old-scheme question the first time its lecture is opened, and `deleteTemplate` still sweeps unopened lectures across the library for the same reason.
+
+**Matching is front-only.** The wording of the question decides; the answer and the tags do not, because both are things you change freely afterwards and neither should move a card out from under you. The back is read too, but only to recover values it can supply — a back that does not fit costs nothing.
+
+`Template.readings(of:dropping:)` returns two patterns, not one: everything present, and the `optional` blanks removed along with the whitespace that only separated them. That is what lets `How does {{disease}} present?\n\n{{details}}` recognise both the card with details and the card without. `Template.tidy` collapses the blank line an unfilled optional blank leaves behind, so a rendered card matches its own shape.
+
+`pieces(_:)` treats a `{{key}}` containing a colon as literal text. Anki's cloze markup wears the same braces — `{{c1::answer}}` — and reading one as a blank named `c1::answer` would make a cloze template impossible to write.
+
+When several shapes fit, the most literal characters in the **front** wins, ties broken on id: which tab a card sits in must not depend on the order templates happened to load in.
+
+Templates are **not** per library — they live in Application Support, so they follow you between courses. One file, `Templates.json`, not a folder of them: a folder meant a delete could half-succeed, leaving a template on disk the app had already stopped listing. `TemplateStore.adoptOldFolder` folds an older `Templates/` directory in once and renames it. Built-ins are merged in by `reload()` whenever the file does not mention them, which is what makes them undeletable without a rule saying so anywhere else.
 
 ### The Anki note type
 
@@ -186,11 +247,13 @@ Two consequences worth knowing before you touch this:
 
 **`Question.swift`** — the core type, plus `CropRect`, `Mask`, `OcclusionMode` and `PageSet`.
 
-Crops are stored **normalized** — fractions of the page box, not points — so a stored crop stays correct at any render width and survives a PDF replaced by an annotated version whose page box differs slightly. `questionCrops` and `answerCrops` are separate maps because Slide2Slide can cite the same page on both sides, and one map keyed by page number cannot distinguish them.
+Crops are stored **normalized** — fractions of the page box, not points — so a stored crop stays correct at any render width and survives a PDF replaced by an annotated version whose page box differs slightly. `questionCrops` and `answerCrops` are separate maps because a question can cite the same page on both sides, and one map keyed by page number cannot distinguish them.
 
 A mask's id is a ULID, not its array position, because it becomes part of the GUID of the card that mask produces. Index-based ids would look identical and silently reshuffle review history the first time a mask was deleted from the middle.
 
 `encode(to:)` is hand-written so Int-keyed maps serialize as string keys; Swift's synthesized encoding emits them as a flat `[key, value, key, value]` array, which is unreadable in a file users are expected to be able to open.
+
+**`Topic.swift`** / **`LectureQuestion.swift`** — the two structured lists that live in the notes file, and the parsers and writers for their blocks. Identity is the text itself (`name.lowercased()`, `text.lowercased()`), so nothing invisible has to be written into a file the user reads in a text editor; the cost is that editing a row re-keys it, which is fine for lists this size and is why neither supports duplicates. `TopicBlock.rate`/`rename`/`remove` do a read-modify-write on *another* lecture's file, for the folder and library scopes; the open lecture always goes through its own `LectureNotes`, which owns the file and is watching it.
 
 **`LectureDocument.swift`** — one PDF and its questions. Autosaves 1.5 s after the last keystroke, forced on commit, lecture switch, resign-active and quit. Writes are atomic (temp file then rename), so a crash cannot truncate a lecture. A file modified underneath the app is copied aside as `.conflict.ankiflow.json` rather than overwritten.
 
@@ -198,7 +261,11 @@ A mask's id is a ULID, not its array position, because it becomes part of the GU
 
 **`OrphanRecovery.swift`** — question files whose PDF has gone. Evidence is tiered: identical file hash, then slide-text overlap, then words shared with the old filename. It proposes and never applies, because a wrong pairing attaches a semester of questions to the wrong slides.
 
-**`UndoLog.swift`** — library-wide undo/redo in `.ankiflow/undo.json`, 40 steps, surviving quit. Each step stores the questions before and after, and the lecture relative to the library root so the log survives the library being moved. A step that trashed files stores where each one went instead, so undo can put them back. Deliberately not in the sidecars: that would rewrite every question file on every small action.
+**`UndoLog.swift`** — library-wide undo/redo for your questions, 40 steps, in memory. Each step stores the questions before and after, and the lecture relative to the library root so the log survives the library being moved. A step that trashed files stores where each one went instead, so undo can put them back. Deliberately not in the sidecars: that would rewrite every question file on every small action.
+
+**Every stack is session-scoped.** This one used to persist to `.ankiflow/undo.json` and reload at launch; it no longer does, and `init` deletes any file an older build left behind. Undoing something from three days ago on a freshly opened app is a worse surprise than having nothing to undo, and one rule across all four stacks is worth more than a longer reach in one of them. Recovering from a deletion noticed later is not undo's job: lectures go to the system Trash, question files are readable JSON, and `OrphanRecovery` reunites a sidecar with its PDF.
+
+**The four stacks, and what routes between them.** `UndoLog` for cards; `PDFEditSession`'s own closure stacks for markup, which are pending until ⌘S; `NotesUndoLog` for topics and lecture questions; and `NSTextView`'s own for typing. `AppState.undo()` dispatches in that order of specificity: markup while the edit bar is up, then the focused text field, then whichever list ledger `lastListSurface` names. That last one is a variable rather than a focus test because clicking a rating chip or a checkbox does not move the first responder.
 
 **`Library.swift`** — scans the folder tree, maps folders to deck names, owns `LibrarySettings`, performs renames, drag-moves and trashing so the question file travels with its PDF, and sweeps away empty question files. `contentsSignature()` hashes folder modification dates; `AppState` polls it every two seconds so changes made in Finder appear without a refresh.
 
@@ -234,7 +301,9 @@ Every component earns its place. The PDF hash means an edited PDF produces new f
 
 **`PDFEditing.swift` / `PDFEditSession.swift` / `PDFEditOverlay.swift`** — the deliberate exception: the only code in the app that writes to the user's lecture file. `PDFEditOverlayView` is a second sibling above the crop overlay whose `hitTest` returns nil unless a tool is in hand, so with editing off the pane behaves exactly as it did before this existed.
 
-`PDFEditSession` is what makes the editor trustworthy. Annotations are added to the **in-memory** `PDFDocument` — which is what the `PDFView` draws, so a mark appears at once — and nothing reaches the file until ⌘S. Undo is a private pair of closure stacks rather than an `NSUndoManager`: AppKit's is shared with every text field in the window, and ⌘U already means "undo what I did to my questions", so `AppState.undo()` routes to the session only while `isEditingPDF`.
+`PDFEditSession` is what makes the editor trustworthy. Annotations are added to the **in-memory** `PDFDocument` — which is what the `PDFView` draws, so a mark appears at once — and nothing reaches the file until ⌘S. Undo is a private pair of closure stacks rather than an `NSUndoManager`: AppKit's is shared with every text field in the window, and ⌘Z already means "undo what I did to my questions", so `AppState.undo()` routes to the session only while `isEditingPDF`.
+
+**Surviving a reload.** The lecture can be replaced under an open session — annotated on an iPad, synced back by the cloud folder. `LectureDocument.reloadPDFFromDisk(replaying:)` *moves* the unsaved annotations onto the freshly-loaded document rather than copying them, so every object an undo step holds is still the object on the page; pages, which cannot survive the swap, are reached through `PDFPageBinding`, a redirection table the session owns and every step's page work goes through. `PDFEditSession.adopt` records the redirection and swaps in a new baseline, and the history keeps working. Only two things break it: a mark PDFKit refused to move across (so a copy had to be made), and a slide you had reordered — neither is replayable, and in both cases `AppState` rebuilds the session instead and the marks arrive as a clean slate.
 
 Two rules in that file are easy to get wrong:
 
@@ -265,7 +334,7 @@ The other thing to know: because `contentHash` includes the PDF's hash, *any* ed
 
 The likeliest fork. Five places, in order:
 
-1. `QuestionKind` in `Question.swift` — add the case. The compiler will then walk you through every switch that needs it.
+1. `QuestionKind` in `Question.swift` — add the case. The compiler will then walk you through every switch that needs it. Removing one is the harder direction: `init(from:)` decodes the kind with `try?` and falls back to `.basic`, so a sidecar naming a kind you deleted still opens instead of throwing away the lecture's questions. Slide2Slide was retired that way.
 2. `PanelType` in `AppState.swift` — add the matching case, `kind`, and `matches(_:)`.
 3. `AppState.counts()` — add it to the tab row.
 4. `QuestionPanel.editor(_:)` — the editing UI for it.

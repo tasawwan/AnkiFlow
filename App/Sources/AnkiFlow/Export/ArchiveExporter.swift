@@ -10,6 +10,9 @@ import Foundation
 /// gives you a library you can open directly.
 struct ArchiveExporter {
     let libraryRoot: URL
+    /// Handed in rather than read from the store, because this runs off the main
+    /// actor and the store lives on it.
+    var settingsFile: URL?
 
     struct Result {
         var lectures = 0
@@ -38,11 +41,12 @@ struct ArchiveExporter {
             }
         }
 
-        // The library's own settings travel too, so deck root and tag choices
-        // survive the trip.
-        let settings = LibraryPaths.settingsURL(inLibrary: libraryRoot)
-        if let data = try? Data(contentsOf: settings) {
-            zip.add(name: ".ankiflow/library.json", data: data)
+        // Settings travel too, so deck root and tag choices survive the trip.
+        // They belong to the app rather than the library now, and go in under a
+        // name that says so -- restoring an archive should not silently adopt
+        // the preferences of whoever made it.
+        if let settingsFile, let data = try? Data(contentsOf: settingsFile) {
+            zip.add(name: "AnkiFlow Settings.json", data: data)
         }
 
         try zip.finish().write(to: destination, options: .atomic)

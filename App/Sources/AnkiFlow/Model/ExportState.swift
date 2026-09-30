@@ -37,8 +37,8 @@ enum ExportDestination: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .anki:    return "Straight into Anki"
-        case .package: return "Anki package (.apkg)"
+        case .anki:    return "Straight into Anki (recommended)"
+        case .package: return "Anki package (.apkg) — last resort"
         case .archive: return "Lectures + questions (.zip)"
         }
     }
@@ -60,7 +60,10 @@ struct ExportSummary {
     /// not delete these; the sheet offers a search that selects them.
     var retired: [(qid: String, lecture: String)] = []
     /// Lectures whose folder changed. Anki will not move their cards either.
-    var moved: [(lecture: String, from: String, to: String)] = []
+    var moved: [DeckMove] = []
+    /// Slide images removed from Anki's media folder because nothing pointed at
+    /// them any more. Only set when the export went straight into Anki.
+    var mediaRemoved = 0
 
     var totalNotes: Int { newNotes + changedNotes + unchangedNotes }
 
@@ -80,12 +83,50 @@ struct ExportSummary {
     /// this report exists — so after the export these cards already carry the
     /// new tag and are still sitting in the old deck. The old tag no longer
     /// exists on them, and searching for it found nothing.
+    /// The ones that need you to decide. The automatic ones have already been
+    /// applied by the time you see this sheet, so offering them again would be
+    /// asking about work that is done.
+    var offeredMoves: [DeckMove] { moved.filter { !$0.isAutomatic } }
+
     func moveSearches() -> [(to: String, search: String)] {
-        moved.map { move in (to: move.to, search: Self.moveSearch(to: move.to)) }
+        offeredMoves.map { move in
+            (to: move.to, search: Self.moveSearch(from: move.from, to: move.to))
+        }
     }
 
-    static func moveSearch(to deck: String) -> String {
-        let tag = deck.replacingOccurrences(of: " ", with: "-")
-        return "\(AnkiIdentity.noteTypeScope) \"tag:\(tag)\" -\"deck:\(deck)\""
+    /// Everything belonging to this lecture that is not already in the deck it
+    /// should be in.
+    ///
+    /// Three clauses because a card can be in three states after an export that
+    /// changed the deck name. Unchanged notes were not re-imported at all, so
+    /// they still carry the old tag. Changed notes *were* re-imported and took
+    /// the new tag -- but Anki still refused to move the card, so they sit in
+    /// the old deck wearing the new tag. And a card you dragged somewhere by
+    /// hand in the browser has neither deck. Matching on any of the three and
+    /// excluding the destination catches all of them exactly once.
+    ///
+    /// It can't reach another lecture: every one of these names ends in this
+    /// lecture's own file name, which is the deepest level of the path.
+    static func moveSearch(from oldDeck: String, to newDeck: String) -> String {
+        let oldTag = oldDeck.replacingOccurrences(of: " ", with: "-")
+        let newTag = newDeck.replacingOccurrences(of: " ", with: "-")
+        return "\(AnkiIdentity.noteTypeScope) "
+            + "(\"deck:\(oldDeck)\" OR \"tag:\(oldTag)\" OR \"tag:\(newTag)\") "
+            + "-\"deck:\(newDeck)\""
     }
+}
+
+/// A lecture whose cards are not where its folders say they should be.
+struct DeckMove: Identifiable {
+    let lecture: String
+    let url: URL
+    let from: String
+    let to: String
+    /// True when the two names agreed about everything they both knew and the
+    /// new one simply knows more -- you opened a wider folder. Those are applied
+    /// during the export instead of being offered, because there is nothing to
+    /// decide. A rename or a moved lecture is false, and gets asked about.
+    let isAutomatic: Bool
+
+    var id: String { url.path + "→" + to }
 }

@@ -14,6 +14,7 @@ struct TemplateEditor: View {
     @State var template: Template
     @State private var selection: NSRange?
     @State private var showBackSection = false
+    @State private var newTag = ""
 
     private var derivedBlanks: [TemplateBlank] {
         let keys = Template.keys(in: template.front) + Template.keys(in: template.back)
@@ -43,18 +44,44 @@ struct TemplateEditor: View {
             Text("Name").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             TextField("Clinical Correlation", text: $template.name)
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 260)
+                .frame(width: 220)
+
+            // Which kind of card this shape makes. A template is a way of
+            // writing a card, and occlusion and cloze cards get written to a
+            // pattern as much as basic ones do.
+            Picker("", selection: $template.kind) {
+                Text("Basic").tag(QuestionKind.basic)
+                Text("Occlusion").tag(QuestionKind.occlusion)
+                Text("Cloze").tag(QuestionKind.cloze)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 230)
+
             Spacer()
-            Text("Select a phrase, then ⌘B to make it a blank")
+            Text(hint)
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
         }
         .padding(12)
     }
 
+    /// What the front field is for changes with the kind, so the line that tells
+    /// you how to use it changes too.
+    private var hint: String {
+        switch template.kind {
+        case .occlusion:
+            return "The front is the prompt above the image"
+        case .cloze:
+            return "Write the sentence; deletions are added on the card"
+        case .basic, .template:
+            return "Select a phrase, then ⌘B to make it a blank"
+        }
+    }
+
     private var editorSide: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("FRONT")
+            Text(template.kind == .occlusion ? "PROMPT" : "FRONT")
                 .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
             BlankAwareTextView(text: $template.front, selection: $selection)
                 .frame(minHeight: 120)
@@ -71,22 +98,52 @@ struct TemplateEditor: View {
                     .foregroundStyle(.secondary)
             }
 
+            optionsSection
+            blanksSection
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(minWidth: 340)
+    }
+
+    /// What this shape decides once, so no question built from it has to: which
+    /// side the slides go on, and what the card is tagged.
+    private var optionsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Divider()
 
-            HStack(spacing: 10) {
-                Text("SLIDES ON")
-                    .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
-                Picker("", selection: $template.slides) {
-                    ForEach(TemplateSlides.allCases) { side in
-                        Text(side.label).tag(side)
+            // Occlusion and cloze cards have one place to put a slide, so there
+            // is nothing here to choose.
+            if template.kind == .basic {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 10) {
+                        Text("SLIDES GO ON")
+                            .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                        Picker("", selection: $template.slides) {
+                            ForEach(TemplateSlides.allCases) { side in
+                                Text(side.label).tag(side)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 200)
+                        Spacer(minLength: 0)
                     }
+                    Text("Which row ⌘T aims at when you open one of these. Both rows are always there — this just saves you clicking the usual one.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 200)
-                Spacer(minLength: 0)
+
+                Divider()
             }
 
+            tagsRow
+        }
+    }
+
+    private var blanksSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Divider()
 
             Text("BLANKS")
@@ -104,10 +161,93 @@ struct TemplateEditor: View {
                 }
                 .frame(maxHeight: 130)
             }
-            Spacer(minLength: 0)
         }
-        .padding(12)
-        .frame(minWidth: 340)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Tags every question made under this template is born with.
+    ///
+    /// The same vocabulary the question panel uses, ticked here once instead of
+    /// on every card. A tag typed in gets hyphenated on the way, because Anki
+    /// splits its tag field on whitespace and a tag with a space in it arrives
+    /// there as two.
+    private var tagsRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("TAGS")
+                .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+
+            HStack(alignment: .center, spacing: 10) {
+                YieldButton(tags: template.tags) { tag in
+                    template.tags.removeAll(where: TagDefinition.isYield)
+                    if let tag { template.tags.append(tag) }
+                }
+                FlowLayout(spacing: 8) {
+                    ForEach(otherTags) { definition in
+                        tagCheckbox(definition.name)
+                    }
+                    ForEach(strayTags, id: \.self) { tagCheckbox($0) }
+                }
+            }
+
+            HStack(spacing: 6) {
+                TextField("New tag", text: $newTag)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 150)
+                    .onSubmit(addTag)
+                Button("Add", action: addTag)
+                    .controlSize(.small)
+                    .disabled(TagDefinition.normalise(newTag).isEmpty)
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    /// Yield has its own control, so it is not also a checkbox.
+    private var otherTags: [TagDefinition] {
+        (state.library?.settings.activeTags ?? []).filter { !TagDefinition.isYield($0.name) }
+    }
+
+    /// Tags this template carries that the library's list has never heard of --
+    /// a template written under another library, most often.
+    private var strayTags: [String] {
+        let known = Set((state.library?.settings.tags ?? []).map(\.name))
+        return template.tags.filter { !known.contains($0) && !TagDefinition.isYield($0) }
+    }
+
+    private func tagCheckbox(_ name: String) -> some View {
+        let isOn = template.tags.contains(name)
+        return Button {
+            if let index = template.tags.firstIndex(of: name) {
+                template.tags.remove(at: index)
+            } else {
+                // Yield is one choice, here as everywhere: picking one drops
+                // whichever was on.
+                if TagDefinition.isYield(name) {
+                    template.tags.removeAll(where: TagDefinition.isYield)
+                }
+                template.tags.append(name)
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: isOn ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 12))
+                    .foregroundStyle(isOn ? palette.select : Color.secondary)
+                Text(name).font(.system(size: 11.5))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func addTag() {
+        let name = TagDefinition.normalise(newTag)
+        guard !name.isEmpty else { return }
+        if let library = state.library,
+           !library.settings.tags.contains(where: { $0.name == name }) {
+            library.settings.tags.append(TagDefinition(name: name, pinned: false))
+        }
+        if !template.tags.contains(name) { template.tags.append(name) }
+        newTag = ""
     }
 
     private func blankRow(_ blank: TemplateBlank) -> some View {
@@ -151,7 +291,7 @@ struct TemplateEditor: View {
             .fill(Color.secondary.opacity(0.12))
             .frame(height: 90)
             .overlay(
-                Text("attached slides")
+                Text(template.kind == .occlusion ? "the slide, with regions hidden" : "attached slides")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             )
     }
@@ -163,11 +303,11 @@ struct TemplateEditor: View {
 
             VStack(alignment: .leading, spacing: 10) {
                 previewText(template.front)
-                if template.slides.showsFront { slidePlaceholder }
-                if !template.back.isEmpty || template.slides.showsBack {
+                if template.effectiveSlides.showsFront { slidePlaceholder }
+                if !template.back.isEmpty || template.effectiveSlides.showsBack {
                     Divider()
                 }
-                if template.slides.showsBack { slidePlaceholder }
+                if template.effectiveSlides.showsBack { slidePlaceholder }
                 if !template.back.isEmpty {
                     previewText(template.back)
                 }

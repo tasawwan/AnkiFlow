@@ -20,6 +20,14 @@ struct ChipRow: View {
     /// mark on it. Clicking the badge lists them so any one can be removed.
     var croppedPages: [Int] = []
     var onRemoveCrop: (Int) -> Void = { _ in }
+    /// Whether the crop list is open, and how to flip it. Held by the caller --
+    /// see `AppState.expandedCropRow` -- because this view is rebuilt on every
+    /// keystroke while you type in the card, which reset the `@State` version
+    /// before you could use it.
+    var showingCrops: Bool = false
+    /// Lit while the next drag on a slide will crop it.
+    var isCropping: Bool = false
+    var onToggleCrops: () -> Void = { }
     /// Clicking a row arms it. This replaces a keyboard shortcut for swapping
     /// sides -- pointing at the row you mean is self-explanatory, a shortcut for
     /// it was not.
@@ -27,7 +35,6 @@ struct ChipRow: View {
     let onChange: ([Int]) -> Void
 
     @State private var isEditing = false
-    @State private var showingCrops = false
     @State private var draft = ""
     @FocusState private var fieldFocused: Bool
 
@@ -36,8 +43,16 @@ struct ChipRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             row
-            if showingCrops, !croppedPages.isEmpty {
-                cropEditor
+            if showingCrops {
+                if croppedPages.isEmpty {
+                    Text(isCropping ? "Drag on the slide to crop it."
+                                    : "Nothing cropped on this side.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(palette.dim)
+                        .padding(.top, 5)
+                } else {
+                    cropEditor
+                }
             }
         }
         .padding(.vertical, 7)
@@ -50,9 +65,7 @@ struct ChipRow: View {
             RoundedRectangle(cornerRadius: 7)
                 .stroke(isArmed ? palette.amber.opacity(0.55) : palette.line, lineWidth: 1)
         )
-        .onChange(of: croppedPages) { _, pages in
-            if pages.isEmpty { showingCrops = false }
-        }
+
     }
 
     /// One removable entry per cropped slide. Inline rather than in a popover,
@@ -129,8 +142,10 @@ struct ChipRow: View {
                     .background(palette.amber.opacity(0.28), in: Capsule())
             }
 
-            // What ⌘E would take if you pressed it now.
-            if let ghostPage {
+            // What ⌘E would take if you pressed it now -- unless it is already
+            // attached, in which case the chip beside it says so and a dashed
+            // copy of the same number reads as a second, pending slide 12.
+            if let ghostPage, !pages.contains(ghostPage) {
                 Text("…\(ghostPage)")
                     .font(.system(size: 11.5, design: .monospaced))
                     .foregroundStyle(palette.dim)
@@ -144,29 +159,39 @@ struct ChipRow: View {
                     )
             }
 
-            if !croppedPages.isEmpty {
+            // Shown on the armed row whether or not anything is cropped yet:
+            // it is the way you *start* a crop, not only the way you review
+            // one. Hiding it until a crop existed meant the only route in was
+            // a modifier you had to know about.
+            if isArmed || !croppedPages.isEmpty {
                 // A plain badge, not a menu control: it is a count first and a
                 // button second. Clicking opens the list inline, the same way
                 // clicking the chips opens the page field.
                 Button {
-                    showingCrops.toggle()
+                    onArm()
+                    onToggleCrops()
                 } label: {
                     HStack(spacing: 3) {
                         Image(systemName: "crop")
                             .font(.system(size: 9.5, weight: .semibold))
-                        Text("\(croppedPages.count)")
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        if !croppedPages.isEmpty {
+                            Text("\(croppedPages.count)")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        }
                     }
-                    .foregroundStyle(showingCrops ? palette.ink : palette.ink2)
+                    .foregroundStyle(isCropping || showingCrops ? palette.ink : palette.ink2)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2.5)
                     .background(
-                        Capsule().fill(showingCrops ? palette.amber.opacity(0.18) : Color.clear)
+                        Capsule().fill(isCropping ? palette.amber.opacity(0.4)
+                                       : showingCrops ? palette.amber.opacity(0.18) : Color.clear)
                     )
                     .overlay(Capsule().strokeBorder(palette.line, lineWidth: 1))
                 }
                 .buttonStyle(.plain)
-                .help(croppedPages.count == 1
+                .help(croppedPages.isEmpty
+                      ? "Crop a slide — then drag on it"
+                      : croppedPages.count == 1
                       ? "1 slide is cropped — click to edit"
                       : "\(croppedPages.count) slides are cropped — click to edit")
             }

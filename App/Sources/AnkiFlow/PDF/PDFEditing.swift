@@ -25,6 +25,31 @@ import CoreGraphics
 @MainActor
 enum PDFEditing {
     nonisolated static let flagKey = "com.ankiflow.flag"
+    /// How a page tag says it is one.
+    ///
+    /// In `/T`, the annotation's title field, rather than in `/Contents` --
+    /// because on a FreeText annotation `/Contents` *is* the words on the page,
+    /// and a tag has to be able to say "CC" and still be recognisable as ours.
+    /// `/T` is a real PDF field, so unlike a private key it is guaranteed to
+    /// survive a round trip through any reader.
+    nonisolated static let pageTagOwner = "AnkiFlow tag"
+
+    /// Where the corner marks sit, and how big they are.
+    ///
+    /// Top left, because the slide-number badge lives in the other corner. All
+    /// of it measured against the crop box, so a trimmed slide keeps its marks
+    /// on the part of the page you can still see.
+    nonisolated static let markerSize: CGFloat = 26
+    nonisolated static let markerInset: CGFloat = 10
+    nonisolated static let markerGap: CGFloat = 4
+    nonisolated static let flagLineWidth: CGFloat = 3
+    /// Free highlights are Ink like sketches are, so they carry a tag to tell
+    /// the two apart -- the eraser needs to know which is which, and `contents`
+    /// on an Ink annotation is not shown by any viewer.
+    nonisolated static let highlighterKey = "com.ankiflow.highlighter"
+    /// A highlighter at setting 3 is a highlighter, not a fat pen. The slider
+    /// stays 1-8 for every tool; this is what those numbers mean on the page.
+    nonisolated static let highlighterScale: CGFloat = 5
     enum Failure: LocalizedError {
         case writeFailed(String)
         case wouldEmpty
@@ -124,7 +149,7 @@ enum PDFEditing {
     /// Insert every page of another PDF at `destination` (1-based).
     static func insert(contentsOf url: URL, at destination: Int, in document: PDFDocument) throws -> Change {
         guard let incoming = PDFDocument(url: url), incoming.pageCount > 0 else {
-            throw Failure.notAPDF(url.lastPathComponent)
+            throw Failure.notAPDF(url.finderName)
         }
         let at = min(max(destination, 1), document.pageCount + 1)
         // Counted rather than assumed: a page PDFKit declines to copy is one
@@ -136,7 +161,7 @@ enum PDFEditing {
             document.insert(page, at: at - 1 + inserted)
             inserted += 1
         }
-        guard inserted > 0 else { throw Failure.notAPDF(url.lastPathComponent) }
+        guard inserted > 0 else { throw Failure.notAPDF(url.finderName) }
 
         var remap: [Int: Int] = [:]
         // Only the pages at or after the insertion point move.
@@ -182,13 +207,20 @@ enum PDFEditing {
         /// you are not holding something else -- a pointer tool you have to
         /// select is a tool you have to remember to put down.
         case select
+        case lasso
         /// The three text marks are modes, not one-shot buttons: pick one up and
         /// every stretch of text you drag over gets marked, which is how you get
         /// through a slide rather than selecting-then-clicking each time.
         case highlight
         case underline
         case strikeOut
+        /// Highlight for slides with no text layer under them -- a scan, or a
+        /// figure. Drawn like the pen rather than dragged as a box: a wide,
+        /// translucent stroke you sweep over whatever you meant to mark.
+        case freeHighlight
         case pen
+        /// Takes out whole marks, not pixels. See `eraseMarks`.
+        case eraser
         case line
         case arrow
         case rectangle
@@ -204,9 +236,12 @@ enum PDFEditing {
         var label: String {
             switch self {
             case .select:     return "Select"
+            case .lasso:      return "Lasso"
             case .highlight:  return "Highlight"
             case .underline:  return "Underline"
             case .strikeOut:  return "Strikethrough"
+            case .freeHighlight: return "Free Highlight"
+            case .eraser:     return "Eraser"
             case .pen:        return "Sketch"
             case .line:       return "Line"
             case .arrow:      return "Arrow"
@@ -220,9 +255,12 @@ enum PDFEditing {
         var symbol: String {
             switch self {
             case .select:     return "cursorarrow"
+            case .lasso:      return "lasso"
             case .highlight:  return "highlighter"
             case .underline:  return "underline"
             case .strikeOut:  return "strikethrough"
+            case .freeHighlight: return "highlighter"
+            case .eraser:     return "eraser"
             case .pen:        return "scribble"
             case .line:       return "line.diagonal"
             case .arrow:      return "line.diagonal.arrow"
@@ -236,9 +274,12 @@ enum PDFEditing {
         var help: String {
             switch self {
             case .select:     return "Click a mark to move, resize or delete it"
+            case .lasso:      return "Drag around a mark to select it"
             case .highlight:  return "Drag across text to highlight it"
             case .underline:  return "Drag across text to underline it"
             case .strikeOut:  return "Drag across text to strike it through"
+            case .freeHighlight: return "Draw over anything to highlight it — no text needed"
+            case .eraser:     return "Drag across marks to rub them out"
             case .pen:        return "Draw freehand"
             case .line:       return "Drag a line"
             case .arrow:      return "Drag an arrow"
@@ -266,11 +307,17 @@ enum PDFEditing {
         }
 
         /// True for the tools you put down again as soon as you have used them.
-        /// The text marks and Select stay in your hand; a shape does not, so the
-        /// thing you just drew can be moved without going and finding a pointer.
+        ///
+        /// A shape is one-shot, so the thing you just drew can be nudged without
+        /// going and finding a pointer. Select, the text marks and Sketch are
+        /// modes and stay in your hand: you draw several strokes in a row far
+        /// more often than one, and a pen that jumps back to the pointer after
+        /// every stroke cannot be used to write.
         var isOneShot: Bool {
             switch self {
-            case .select, .highlight, .underline, .strikeOut: return false
+            case .select, .highlight, .underline, .strikeOut,
+                 .freeHighlight, .pen, .eraser: return false
+            case .lasso: return false
             default: return true
             }
         }
@@ -278,6 +325,18 @@ enum PDFEditing {
         /// Shapes and text are drawn by dragging a rectangle out.
         var drawsRectangle: Bool {
             self == .rectangle || self == .oval || self == .text || self == .trim
+        }
+
+        /// Drawn by dragging a freehand stroke out.
+        var drawsStroke: Bool { self == .pen || self == .freeHighlight }
+
+        /// True for the tools that keep working over marks already on the page
+        /// rather than picking those marks up. They are the ones you hold down
+        /// and repeat, so a press has to mean "do it again here", not "select
+        /// that": you hatch over your own sketch, highlight over a highlight,
+        /// and an eraser that grabbed instead of erasing would be useless.
+        var paintsOverMarks: Bool {
+            self == .pen || self == .eraser || self == .freeHighlight
         }
 
         var drawsLine: Bool { self == .line || self == .arrow }
@@ -321,52 +380,375 @@ enum PDFEditing {
     static func marks(for selection: PDFSelection?, kind: TextMark,
                       colour: NSColor) -> [(annotation: PDFAnnotation, page: PDFPage)] {
         guard let selection else { return [] }
+        let group = markGroupPrefix + ULID.generate()
         var made: [(annotation: PDFAnnotation, page: PDFPage)] = []
         for line in selection.selectionsByLine() {
+            // A line with no selected text in it is not a line of the selection.
+            //
+            // `selectionsByLine()` hands back rows the selection does not
+            // actually cover -- a blank row it stepped over, and on some pages a
+            // spurious one whose bounds sit nowhere near what you dragged. Both
+            // used to become a mark, which is where the solid bars over empty
+            // paper came from: one per marking action, somewhere else on the
+            // page entirely.
+            guard line.string?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            else { continue }
+
             for page in line.pages {
                 let bounds = line.bounds(for: page)
                 guard bounds.width > 1, bounds.height > 1 else { continue }
-                let annotation = PDFAnnotation(bounds: bounds, forType: kind.subtype,
-                                               withProperties: nil)
-                annotation.color = colour
-                // PDFKit expects the quadrilateral in perimeter order.
-                let p1 = CGPoint(x: bounds.minX, y: bounds.maxY)
-                let p2 = CGPoint(x: bounds.maxX, y: bounds.maxY)
-                let p3 = CGPoint(x: bounds.minX, y: bounds.minY)
-                let p4 = CGPoint(x: bounds.maxX, y: bounds.minY)
-                annotation.quadrilateralPoints = [NSValue(point: p1), NSValue(point: p2), NSValue(point: p3), NSValue(point: p4)]
-                annotation.shouldDisplay = true
-                made.append((annotation, page))
+                // And never outside the selection itself. Whatever PDFKit means
+                // by a line, a mark that lands beyond the box around everything
+                // you selected is wrong by definition.
+                let whole = selection.bounds(for: page)
+                guard whole.width > 0, whole.height > 0, whole.insetBy(dx: -2, dy: -2).contains(
+                    CGPoint(x: bounds.midX, y: bounds.midY)) else { continue }
+                // One mark per run of actual text, not one per line.
+                //
+                // `bounds(for:)` is the box around everything selected on that
+                // line, and a slide's text layer puts things on the same line
+                // that are nowhere near each other -- a caption beside a figure,
+                // two columns, a label floating to the right. Marking the box
+                // then paints a bar straight across the gap between them, over
+                // artwork and empty space that was never selected.
+                for run in textRuns(in: bounds, on: page) {
+                    made.append((mark(run, kind: kind, colour: colour, group: group), page))
+                }
             }
-
         }
         return made
     }
 
+    /// Everything one marking action produced wears the same id.
+    ///
+    /// A sentence marked across four lines is four annotations -- that is how
+    /// PDF highlights work -- but it is one thing you did, so it has to behave
+    /// like one thing: click any line and you have the sentence, delete and the
+    /// sentence goes, recolour and the sentence changes.
+    static let markGroupPrefix = "ankiflow.mark:"
+
+    static func markGroup(of annotation: PDFAnnotation) -> String? {
+        guard let contents = annotation.contents,
+              contents.hasPrefix(markGroupPrefix) else { return nil }
+        return contents
+    }
+
+    static func isTextMark(_ annotation: PDFAnnotation) -> Bool {
+        markGroup(of: annotation) != nil
+    }
+
+    /// Full strength, now that highlights are composited rather than laid over.
+    ///
+    /// The old 0.38 was working around the wrong thing: PDFKit paints a
+    /// highlight *over* the text with ordinary alpha, so a strong colour turned
+    /// black type olive, and the only way to keep the words readable was to
+    /// make the mark faint. Multiplying instead leaves black text black at any
+    /// strength -- which is what a real highlighter does, and what Preview and
+    /// the iPad have been doing all along.
+    static func markColour(_ colour: NSColor, kind: TextMark) -> NSColor {
+        kind == .highlight ? colour.withAlphaComponent(1) : colour
+    }
+
+    // MARK: - Highlights, drawn properly
+
+    /// `type` comes back as "Highlight" or "/Highlight" depending on where the
+    /// annotation came from, so the suffix is what to test.
+    static func isHighlight(_ annotation: PDFAnnotation) -> Bool {
+        (annotation.type ?? "").hasSuffix("Highlight")
+    }
+
+    /// Stops PDFKit drawing the highlights so we can draw them ourselves.
+    ///
+    /// The flag lives on the annotation and would be written into your file as
+    /// a hidden flag, which would make every highlight vanish in Preview -- so
+    /// `save(_:to:)` puts them all back before it writes and takes them over
+    /// again afterwards. That is the only place a document is written, which is
+    /// what makes this safe to do at all.
+    /// An annotation moved to another copy of the same lecture.
+    ///
+    /// Property by property rather than through an archiver: quad points are
+    /// relative to the annotation's own bounds, so they carry across verbatim,
+    /// and an image stamp is a subclass of ours that a generic copy would
+    /// silently turn into an empty stamp. Everything here was made by this app
+    /// minutes ago, which is what makes a faithful copy possible at all.
+    static func copy(_ annotation: PDFAnnotation) -> PDFAnnotation? {
+        if let stamp = annotation as? PDFImageStamp {
+            return PDFImageStamp(image: stamp.image, bounds: stamp.bounds)
+        }
+        guard let type = annotation.type else { return nil }
+        let subtype = PDFAnnotationSubtype(rawValue: type.hasPrefix("/") ? type : "/" + type)
+        let made = PDFAnnotation(bounds: annotation.bounds, forType: subtype, withProperties: nil)
+        made.color = annotation.color
+        made.contents = annotation.contents
+        made.quadrilateralPoints = annotation.quadrilateralPoints
+        made.border = annotation.border
+        made.interiorColor = annotation.interiorColor
+        made.startPoint = annotation.startPoint
+        made.endPoint = annotation.endPoint
+        made.font = annotation.font
+        made.fontColor = annotation.fontColor
+        made.alignment = annotation.alignment
+        if let paths = annotation.paths {
+            for path in paths { made.add(path) }
+        }
+        made.shouldDisplay = annotation.shouldDisplay
+        return made
+    }
+
+    /// Which annotations *we* hid, so restoring puts back only those.
+    ///
+    /// A highlight that was already hidden in your file was hidden by whoever
+    /// wrote it, and un-hiding it on the next save would be this app editing
+    /// your document without being asked.
+    private static var hiddenByUs = Set<ObjectIdentifier>()
+
+    static func takeOverHighlights(in document: PDFDocument?) {
+        forEachHighlight(in: document) { annotation in
+            guard annotation.shouldDisplay else { return }
+            annotation.shouldDisplay = false
+            hiddenByUs.insert(ObjectIdentifier(annotation))
+        }
+    }
+
+    static func restoreHighlights(in document: PDFDocument?) {
+        forEachHighlight(in: document) { annotation in
+            guard hiddenByUs.contains(ObjectIdentifier(annotation)) else { return }
+            annotation.shouldDisplay = true
+        }
+    }
+
+    private static func forEachHighlight(in document: PDFDocument?,
+                                         _ body: (PDFAnnotation) -> Void) {
+        guard let document else { return }
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index) else { continue }
+            for annotation in page.annotations where isHighlight(annotation) {
+                body(annotation)
+            }
+        }
+    }
+
+    /// Paints a page's highlights the way a highlighter works: multiplied into
+    /// what is underneath, so the paper goes yellow and the ink stays black.
+    ///
+    /// **PDFKit still draws each annotation.** Nothing here reconstructs a
+    /// highlight from its quad points -- that would square off rounded ends,
+    /// straighten a skewed quad and throw away any appearance the writer gave
+    /// it. The annotation is drawn by the same code that drew it before; the
+    /// only difference is the blend mode of the context it lands in.
+    ///
+    /// `place` maps the page's own coordinate space into whatever is being
+    /// drawn -- the view, or the card image -- so the screen and the exported
+    /// slide go through one function and cannot drift apart.
+    static func drawHighlights(on page: PDFPage, box: PDFDisplayBox = .cropBox,
+                               place: (CGContext) -> Void) {
+        let highlights = page.annotations.filter(isHighlight)
+        guard !highlights.isEmpty,
+              let context = NSGraphicsContext.current?.cgContext else { return }
+
+        context.saveGState()
+        context.setBlendMode(.multiply)
+        place(context)
+        for annotation in highlights {
+            // Visible for exactly this call. `shouldDisplay` is what keeps
+            // PDFKit from drawing it in the ordinary pass; drawing it here is
+            // the whole point of having hidden it.
+            guard hiddenByUs.contains(ObjectIdentifier(annotation)) else { continue }
+            let authored = annotation.color
+            annotation.shouldDisplay = true
+            // Ours were drawn faint to survive being laid over text. Multiplied,
+            // that is no longer necessary, so they are shown at full strength --
+            // for the drawing only, never written. A highlight you made
+            // somewhere else is shown exactly as you made it.
+            if isTextMark(annotation), authored.alphaComponent < 0.99 {
+                annotation.color = authored.withAlphaComponent(1)
+            }
+            annotation.draw(with: box, in: context)
+            annotation.color = authored
+            annotation.shouldDisplay = false
+        }
+        context.restoreGState()
+    }
+
+    private static func mark(_ bounds: CGRect, kind: TextMark, colour: NSColor,
+                             group: String) -> PDFAnnotation {
+        let annotation = PDFAnnotation(bounds: bounds, forType: kind.subtype,
+                                       withProperties: nil)
+        annotation.color = markColour(colour, kind: kind)
+        annotation.contents = group
+        // Perimeter order, and **relative to the annotation's own bounds** --
+        // not page coordinates.
+        //
+        // This is the stray bar. Handing PDFKit absolute page points put the
+        // quad at bounds.origin + the point, so every mark drew its text
+        // highlight in the right place and a second copy of itself displaced by
+        // its own origin -- up the page, and further the lower down the page you
+        // marked. One annotation with two rectangles, which is exactly why
+        // moving the good one moved the ghost, deleting it deleted both, and the
+        // ghost could not be clicked: there was nothing there to click, only a
+        // misplaced part of the annotation you already had.
+        let p1 = CGPoint(x: 0, y: bounds.height)
+        let p2 = CGPoint(x: bounds.width, y: bounds.height)
+        let p3 = CGPoint(x: 0, y: 0)
+        let p4 = CGPoint(x: bounds.width, y: 0)
+        annotation.quadrilateralPoints = [NSValue(point: p1), NSValue(point: p2),
+                                          NSValue(point: p3), NSValue(point: p4)]
+        // A new highlight joins the ones we draw ourselves; underlines and
+        // strikethroughs are lines, not washes, and PDFKit draws those fine.
+        annotation.shouldDisplay = !isHighlight(annotation)
+        return annotation
+    }
+
+    /// The characters inside one line's selection, grouped into runs.
+    ///
+    /// Every character whose box sits inside the line's own bounds was between
+    /// the start and end of the selection on that line, so it was selected --
+    /// which is why this can gather them by geometry without needing the
+    /// selection's character ranges, something PDFKit does not hand out.
+    ///
+    /// Runs break where the horizontal gap is wider than the line is tall. That
+    /// is comfortably more than the space between two words at any size, and
+    /// comfortably less than the gap between two columns, so ordinary spaces
+    /// stay inside one mark and a real void splits it in two.
+    private static func textRuns(in lineBounds: CGRect, on page: PDFPage) -> [CGRect] {
+        var boxes: [CGRect] = []
+        for index in 0..<page.numberOfCharacters {
+            let box = page.characterBounds(at: index)
+            guard box.width > 0, box.height > 0,
+                  box.midY > lineBounds.minY, box.midY < lineBounds.maxY,
+                  box.midX > lineBounds.minX - 0.5, box.midX < lineBounds.maxX + 0.5
+            else { continue }
+            boxes.append(box)
+        }
+        // No characters on this line means there is nothing here to mark.
+        //
+        // `selectionsByLine()` hands back a line for every row the drag passed
+        // through, including blank ones, and a blank line's bounds still span
+        // the width of the text column. Falling back to those bounds -- which is
+        // what this did -- painted a bar across empty paper for each of them,
+        // and several stacked on nearly the same spot turned a translucent
+        // highlight into a solid block. Marking nothing is the honest answer.
+        guard !boxes.isEmpty else { return [] }
+
+        boxes.sort { $0.minX < $1.minX }
+        let gapLimit = lineBounds.height
+        var runs: [CGRect] = []
+        var current = boxes[0]
+        for box in boxes.dropFirst() {
+            if box.minX - current.maxX > gapLimit {
+                runs.append(current)
+                current = box
+            } else {
+                current = current.union(box)
+            }
+        }
+        runs.append(current)
+        return runs.filter { $0.width > 1 && $0.height > 1 }
+    }
+
+    /// The pennant on a flagged page.
+    ///
+    /// Still an Ink path, and so still an outline: PDF has no way to fill an
+    /// Ink annotation, `/InkList` being a list of strokes and nothing else.
+    /// PDFKit fills a closed one anyway, which is why it looks solid here and
+    /// hollow everywhere else. That is a cosmetic difference and worth keeping
+    /// the shape for.
+    ///
+    /// **What is not cosmetic is the rectangle.** The bounds used to be the
+    /// whole media box with the pennant drawn small inside it. PDFKit clips to
+    /// the path so nothing looked wrong here -- but every other reader takes
+    /// `/Rect` as the annotation's extent, so in Preview the flag *was* the
+    /// page: it could not be missed by a lasso, and every attempt to select
+    /// something else dragged the pennant along with it. The rectangle now
+    /// fits the pennant, padded by the stroke, which straddles the path and
+    /// would otherwise be clipped by its own bounds.
     static func flag(on page: PDFPage) -> PDFAnnotation {
-        let bounds = page.bounds(for: .cropBox)
-        let marker = PDFAnnotation(bounds: page.bounds(for: .mediaBox),
+        let frame = markerFrame(slot: 0, width: markerSize, in: page.bounds(for: .cropBox))
+        let marker = PDFAnnotation(bounds: frame.insetBy(dx: -flagLineWidth, dy: -flagLineWidth),
                                    forType: .ink, withProperties: nil)
         marker.contents = flagKey
         marker.color = .systemBlue
+        // Page coordinates, which is what `/InkList` holds and what every pen
+        // stroke in this app already writes. The rectangle is the bounding box,
+        // not the origin the points are measured from.
         let path = NSBezierPath()
-        let x = bounds.minX + 8
-        let y = bounds.maxY - 42
-        path.move(to: CGPoint(x: x, y: y + 30))
-        path.line(to: CGPoint(x: x + 30, y: y + 30))
-        path.line(to: CGPoint(x: x + 30, y: y))
-        path.line(to: CGPoint(x: x + 15, y: y + 8))
+        let x = frame.minX, y = frame.minY, w = frame.width, h = frame.height
+        path.move(to: CGPoint(x: x, y: y + h))
+        path.line(to: CGPoint(x: x + w, y: y + h))
+        path.line(to: CGPoint(x: x + w, y: y))
+        path.line(to: CGPoint(x: x + w / 2, y: y + h * 0.3))
         path.line(to: CGPoint(x: x, y: y))
         path.close()
         marker.add(path)
         let border = PDFBorder()
-        border.lineWidth = 4
+        border.lineWidth = flagLineWidth
         marker.border = border
         return marker
     }
 
     nonisolated static func isFlag(_ annotation: PDFAnnotation) -> Bool {
         annotation.contents == flagKey
+    }
+
+    // MARK: - Page tags
+
+    /// Where the nth mark along the top-left corner sits.
+    nonisolated static func markerFrame(slot: CGFloat, width: CGFloat, in box: CGRect) -> CGRect {
+        CGRect(x: box.minX + markerInset + slot,
+               y: box.maxY - markerInset - markerSize,
+               width: width, height: markerSize)
+    }
+
+    nonisolated static func isPageTag(_ annotation: PDFAnnotation) -> Bool {
+        annotation.userName == pageTagOwner
+    }
+
+    nonisolated static func pageTagLabel(of annotation: PDFAnnotation) -> String? {
+        isPageTag(annotation) ? annotation.contents : nil
+    }
+
+    /// A short label beside the pennant -- "CC", "HY", whatever you have made.
+    ///
+    /// FreeText, so the letters are in the file as letters: readable in Preview,
+    /// on the iPad, in anything. Its position is settled by `placeTags`, which
+    /// runs after every change so the row never has a hole in it.
+    static func pageTag(_ label: String, on page: PDFPage) -> PDFAnnotation {
+        let tag = PDFAnnotation(bounds: markerFrame(slot: 0, width: tagWidth(for: label),
+                                                    in: page.bounds(for: .cropBox)),
+                                forType: .freeText, withProperties: nil)
+        tag.contents = label
+        tag.userName = pageTagOwner
+        tag.font = tagFont
+        tag.fontColor = .systemBlue
+        // Transparent, not white: a tag sits on the slide, it does not patch it.
+        tag.color = .clear
+        tag.alignment = .center
+        return tag
+    }
+
+    nonisolated static var tagFont: NSFont { NSFont.boldSystemFont(ofSize: 13) }
+
+    nonisolated static func tagWidth(for label: String) -> CGFloat {
+        let text = label as NSString
+        let measured = text.size(withAttributes: [.font: tagFont]).width
+        return max(markerSize, ceil(measured) + 10)
+    }
+
+    /// Lays the tags out along the corner, after the pennant when there is one.
+    ///
+    /// Called after every add and every removal rather than positioning a tag
+    /// when it is made, because taking the first of three away has to close the
+    /// gap it leaves -- and a tag's place depends on what else is on the page,
+    /// not on when you added it.
+    nonisolated static func placeTags(on page: PDFPage) {
+        let box = page.bounds(for: .cropBox)
+        var offset: CGFloat = page.annotations.contains(where: isFlag)
+            ? markerSize + markerGap : 0
+        for tag in page.annotations where isPageTag(tag) {
+            let width = tagWidth(for: tag.contents ?? "")
+            tag.bounds = markerFrame(slot: offset, width: width, in: box)
+            offset += width + markerGap
+        }
     }
 
     /// A rectangle or an oval.
@@ -419,6 +801,157 @@ enum PDFEditing {
         annotation.border = border
         annotation.add(path)
         return annotation
+    }
+
+    /// A free highlight: the pen's stroke, drawn fat and see-through.
+    static func highlighterStroke(_ path: NSBezierPath, colour: NSColor, width: CGFloat,
+                                  on page: PDFPage) -> PDFAnnotation {
+        let annotation = stroke(path, colour: highlighterColour(colour), width: width, on: page)
+        annotation.contents = highlighterKey
+        return annotation
+    }
+
+    /// See-through enough to read the slide through, opaque enough to see.
+    static func highlighterColour(_ colour: NSColor) -> NSColor {
+        (colour.usingColorSpace(.sRGB) ?? colour).withAlphaComponent(0.35)
+    }
+
+    static func isHighlighter(_ annotation: PDFAnnotation) -> Bool {
+        annotation.contents == highlighterKey
+    }
+
+    /// What an eraser sweep is allowed to take in one pass.
+    ///
+    /// A sweep erases one class and one only. Highlights and sketches end up
+    /// layered on top of each other constantly -- that is what highlighting is
+    /// for -- and a sweep that took both would cost you the drawing every time
+    /// you meant to clear a highlight. Marks win when a sweep touches both, so
+    /// clearing a highlight off a diagram leaves the diagram; a second sweep,
+    /// with the highlight gone, takes the drawing.
+    enum EraseClass {
+        case marks
+        case drawings
+    }
+
+    static func eraseClass(of annotation: PDFAnnotation) -> EraseClass {
+        if isHighlighter(annotation) { return .marks }
+        switch kind(of: annotation) {
+        case "Highlight", "Underline", "StrikeOut": return .marks
+        default: return .drawings
+        }
+    }
+
+    /// A picture off the clipboard, dropped onto a slide at a sensible size.
+    static func imageStamp(_ image: NSImage, on page: PDFPage) -> PDFAnnotation {
+        let box = page.bounds(for: .mediaBox)
+        let native = image.size
+        guard native.width > 0, native.height > 0 else {
+            return PDFImageStamp(image: image, bounds: box.insetBy(dx: box.width / 3,
+                                                                   dy: box.height / 3))
+        }
+        // Big enough to see, small enough to leave the slide visible around it.
+        let scale = min(box.width * 0.45 / native.width,
+                        box.height * 0.45 / native.height, 1)
+        let size = CGSize(width: native.width * scale, height: native.height * scale)
+        let origin = CGPoint(x: box.midX - size.width / 2, y: box.midY - size.height / 2)
+        return PDFImageStamp(image: image, bounds: CGRect(origin: origin, size: size))
+    }
+
+    /// A copy that survives being a picture. `PDFAnnotation.copy()` knows
+    /// nothing about the image a stamp carries, so copy and paste of a pasted
+    /// picture would otherwise hand back an empty box.
+    static func duplicate(_ annotation: PDFAnnotation) -> PDFAnnotation? {
+        if let stamp = annotation as? PDFImageStamp {
+            return PDFImageStamp(image: stamp.image, bounds: stamp.bounds)
+        }
+        return annotation.copy() as? PDFAnnotation
+    }
+
+    static func hasImageStamps(_ document: PDFDocument) -> Bool {
+        (0..<document.pageCount).contains { index in
+            document.page(at: index)?.annotations.contains { $0 is PDFImageStamp } == true
+        }
+    }
+
+    /// The smallest a text box can be and still show everything in it.
+    ///
+    /// One definition, used both when a box is committed and when one is being
+    /// resized, so the size it settles at and the size it refuses to go below
+    /// are the same number.
+    /// The breathing room a text box keeps around its words.
+    nonisolated static let textInset: CGFloat = 8
+
+    /// The styled text of a box, however it happens to be stored.
+    static func attributedText(of annotation: PDFAnnotation) -> NSAttributedString {
+        if let rich = richText(for: annotation) { return rich }
+        let font = annotation.font ?? NSFont.systemFont(ofSize: 14)
+        return NSAttributedString(string: annotation.contents ?? "",
+                                  attributes: [.font: font])
+    }
+
+    static func fittedSize(of text: NSAttributedString) -> CGSize {
+        guard text.length > 0 else { return CGSize(width: 24, height: 24) }
+        let bounds = text.boundingRect(
+            with: NSSize(width: CGFloat.greatestFiniteMagnitude,
+                         height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading])
+        return CGSize(width: max(24, ceil(bounds.width) + textInset),
+                      height: max(24, ceil(bounds.height) + textInset))
+    }
+
+    /// The size the same text needs when it is allowed to wrap at `width`.
+    ///
+    /// The unconstrained measurement above answers a different question -- how
+    /// wide would this be all on one line -- and using it as a minimum is what
+    /// made a paragraph in a text box impossible to narrow.
+    static func fittedSize(of text: NSAttributedString, wrappingAt width: CGFloat) -> CGSize {
+        guard text.length > 0 else { return CGSize(width: 24, height: 24) }
+        let bounds = text.boundingRect(
+            with: NSSize(width: max(1, width - textInset),
+                         height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading])
+        return CGSize(width: max(24, ceil(bounds.width) + textInset),
+                      height: max(24, ceil(bounds.height) + textInset))
+    }
+
+    static func fittedSize(for annotation: PDFAnnotation) -> CGSize {
+        fittedSize(of: attributedText(of: annotation))
+    }
+
+    /// The smallest a text box may be dragged, given the width it is being
+    /// dragged to.
+    ///
+    /// Width and height are two different questions, asked in that order.
+    /// Narrowing a box is how you make its text wrap, so the only real floor on
+    /// width is the longest single word -- below that there is nothing left to
+    /// break. The height then has to be whatever the text needs *once wrapped
+    /// at that width*, which grows as the box narrows. Measuring both against
+    /// one unwrapped line got this backwards on both axes: the width could
+    /// never shrink, and the height could be dragged down over text that had
+    /// wrapped onto four lines.
+    static func minimumSize(for annotation: PDFAnnotation, atWidth width: CGFloat) -> CGSize {
+        let text = attributedText(of: annotation)
+        guard text.length > 0 else { return CGSize(width: 24, height: 24) }
+        let floorWidth = max(24, ceil(longestWordWidth(in: text)) + textInset)
+        let wrapped = fittedSize(of: text, wrappingAt: max(width, floorWidth))
+        return CGSize(width: floorWidth, height: wrapped.height)
+    }
+
+    /// The widest run with no break in it -- the one thing a narrower box
+    /// cannot make room for.
+    private static func longestWordWidth(in text: NSAttributedString) -> CGFloat {
+        var widest: CGFloat = 0
+        let whole = text.string as NSString
+        whole.enumerateSubstrings(in: NSRange(location: 0, length: whole.length),
+                                  options: [.byWords]) { _, range, _, _ in
+            let word = text.attributedSubstring(from: range)
+            let bounds = word.boundingRect(
+                with: NSSize(width: CGFloat.greatestFiniteMagnitude,
+                             height: CGFloat.greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading])
+            widest = max(widest, bounds.width)
+        }
+        return widest
     }
 
     /// An empty text box, ready to be typed into.
@@ -489,7 +1022,14 @@ enum PDFEditing {
             annotation.startPoint = CGPoint(x: start.x + delta.width, y: start.y + delta.height)
             annotation.endPoint = CGPoint(x: end.x + delta.width, y: end.y + delta.height)
         case "Ink":
-            break
+            guard let paths = annotation.paths else { return }
+            let transform = AffineTransform(translationByX: delta.width, byY: delta.height)
+            for path in paths {
+                guard let moved = path.copy() as? NSBezierPath else { continue }
+                moved.transform(using: transform)
+                annotation.remove(path)
+                annotation.add(moved)
+            }
         default:
             annotation.bounds = annotation.bounds.offsetBy(dx: delta.width, dy: delta.height)
         }
@@ -507,10 +1047,26 @@ enum PDFEditing {
                                  forType: .ink, withProperties: nil)
         copy.color = annotation.color
         copy.border = annotation.border
+        copy.contents = annotation.contents
         for path in paths {
             guard let moved = path.copy() as? NSBezierPath else { continue }
             moved.transform(using: transform)
             copy.add(moved)
+        }
+        return copy
+    }
+
+    static func transformedInk(_ annotation: PDFAnnotation, paths: [NSBezierPath],
+                               using transform: AffineTransform, on page: PDFPage) -> PDFAnnotation {
+        let copy = PDFAnnotation(bounds: page.bounds(for: .mediaBox),
+                                 forType: .ink, withProperties: nil)
+        copy.color = annotation.color
+        copy.border = annotation.border
+        copy.contents = annotation.contents
+        for path in paths {
+            guard let transformed = path.copy() as? NSBezierPath else { continue }
+            transformed.transform(using: transform)
+            copy.add(transformed)
         }
         return copy
     }
@@ -548,18 +1104,32 @@ enum PDFEditing {
 
     /// The topmost mark under a point in page coordinates.
     static func mark(at point: CGPoint, on page: PDFPage, tolerance: CGFloat = 6) -> PDFAnnotation? {
-        page.annotations.last { annotation in
-            guard !isFlag(annotation) else { return false }
-            if kind(of: annotation) == "Ink", let paths = annotation.paths, !paths.isEmpty {
-                let origin = annotation.bounds.origin
-                let local = CGPoint(x: point.x - origin.x, y: point.y - origin.y)
-                return paths.contains {
-                    near($0, point: point, tolerance: tolerance)
-                        || near($0, point: local, tolerance: tolerance)
-                }
+        page.annotations.last { hits($0, at: point, tolerance: tolerance) }
+    }
+
+    /// Every mark under a point, topmost first. The eraser needs the whole
+    /// stack, not just the top of it: a highlight under a sketch has to be
+    /// reachable in one sweep.
+    static func marks(at point: CGPoint, on page: PDFPage,
+                      tolerance: CGFloat = 6) -> [PDFAnnotation] {
+        Array(page.annotations.filter { hits($0, at: point, tolerance: tolerance) }.reversed())
+    }
+
+    private static func hits(_ annotation: PDFAnnotation, at point: CGPoint,
+                             tolerance: CGFloat) -> Bool {
+        guard !isFlag(annotation) else { return false }
+        if kind(of: annotation) == "Ink", let paths = annotation.paths, !paths.isEmpty {
+            // A fat highlighter stroke has to be catchable anywhere across its
+            // width, not only along the line its points were recorded on.
+            let reach = max(tolerance, (annotation.border?.lineWidth ?? 1) / 2)
+            let origin = annotation.bounds.origin
+            let local = CGPoint(x: point.x - origin.x, y: point.y - origin.y)
+            return paths.contains {
+                near($0, point: point, tolerance: reach)
+                    || near($0, point: local, tolerance: reach)
             }
-            return frame(of: annotation).insetBy(dx: -2, dy: -2).contains(point)
         }
+        return frame(of: annotation).insetBy(dx: -2, dy: -2).contains(point)
     }
 
     /// Whether a point lands on a path, judged by its control points. Exact
@@ -592,6 +1162,65 @@ enum PDFEditing {
 
     // MARK: - Saving
 
+    /// Burn pasted pictures into the pages that carry them.
+    ///
+    /// A `PDFImageStamp` draws itself, which is all the editor needs but is not
+    /// how PDF works: `write(to:)` serialises an annotation's dictionary, and a
+    /// Stamp with no appearance stream comes back as an empty box. So before
+    /// writing, any page holding one is rebuilt with the picture as part of the
+    /// page itself.
+    ///
+    /// The rebuild draws the page through PDFKit rather than rasterising it, so
+    /// the text stays text -- search, extraction and the card renderer all still
+    /// work on the result. Every other mark is hidden for the draw and copied
+    /// onto the new page afterwards, so highlights and sketches stay live
+    /// annotations you can still move and erase.
+    static func flattenImageStamps(in document: PDFDocument) -> PDFDocument {
+        guard hasImageStamps(document) else { return document }
+
+        // Serialised first and patched second, so every page without a picture
+        // on it goes out exactly as `write(to:)` would have written it. Only the
+        // pages that actually carry a stamp are rebuilt.
+        guard let data = document.dataRepresentation(),
+              let flattened = PDFDocument(data: data),
+              flattened.pageCount == document.pageCount else { return document }
+
+        for index in 0..<document.pageCount {
+            guard let live = document.page(at: index),
+                  live.annotations.contains(where: { $0 is PDFImageStamp }),
+                  let rebuilt = burnStamps(on: live) else { continue }
+            flattened.removePage(at: index)
+            flattened.insert(rebuilt, at: index)
+        }
+        return flattened
+    }
+
+    private static func burnStamps(on page: PDFPage) -> PDFPage? {
+        var box = page.bounds(for: .mediaBox)
+        guard box.width > 0, box.height > 0 else { return nil }
+
+        let keep = page.annotations.filter { !($0 is PDFImageStamp) }
+        let wereShown = keep.filter(\.shouldDisplay)
+        for annotation in wereShown { annotation.shouldDisplay = false }
+        defer { for annotation in wereShown { annotation.shouldDisplay = true } }
+
+        let data = NSMutableData()
+        guard let consumer = CGDataConsumer(data: data),
+              let context = CGContext(consumer: consumer, mediaBox: &box, nil) else { return nil }
+        context.beginPDFPage(nil)
+        page.draw(with: .mediaBox, to: context)
+        context.endPDFPage()
+        context.closePDF()
+
+        guard let rebuilt = PDFDocument(data: data as Data)?.page(at: 0) else { return nil }
+        rebuilt.rotation = page.rotation
+        for annotation in keep {
+            guard let copy = duplicate(annotation) else { continue }
+            rebuilt.addAnnotation(copy)
+        }
+        return rebuilt
+    }
+
     /// Writes the document back over the file it came from.
     ///
     /// Written to a neighbouring temporary file and swapped in, so an interrupted
@@ -603,13 +1232,17 @@ enum PDFEditing {
             .appendingPathComponent(".\(url.lastPathComponent).ankiflow-write")
         defer { try? FileManager.default.removeItem(at: temporary) }
 
-        guard document.write(to: temporary) else {
-            throw Failure.writeFailed(url.lastPathComponent)
+        // Visible again for the write, hidden again after. Their hidden flag is
+        // ours, not yours, and it has no business being in your file.
+        restoreHighlights(in: document)
+        defer { takeOverHighlights(in: document) }
+        guard flattenImageStamps(in: document).write(to: temporary) else {
+            throw Failure.writeFailed(url.finderName)
         }
         do {
             _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
         } catch {
-            throw Failure.writeFailed(url.lastPathComponent)
+            throw Failure.writeFailed(url.finderName)
         }
     }
 }
@@ -625,5 +1258,36 @@ extension CropRect {
         guard old.width > 0, old.height > 0, new.width > 0, new.height > 0 else { return self }
         let absolute = rect(in: old)
         return CropRect(rect: absolute, in: new)
+    }
+}
+
+
+/// A picture pasted onto a slide.
+///
+/// PDFKit has no image annotation, so this is a Stamp that draws itself. That
+/// is enough to move and resize it like any other mark while you are editing;
+/// making it permanent is `PDFEditing.flattenImageStamps`, which runs on the
+/// way to disk.
+final class PDFImageStamp: PDFAnnotation {
+    let image: NSImage
+
+    init(image: NSImage, bounds: CGRect) {
+        self.image = image
+        super.init(bounds: bounds, forType: .stamp, withProperties: nil)
+        shouldDisplay = true
+    }
+
+    required init?(coder: NSCoder) {
+        self.image = NSImage()
+        super.init(coder: coder)
+    }
+
+    override func draw(with box: PDFDisplayBox, in context: CGContext) {
+        var frame = bounds
+        guard let picture = image.cgImage(forProposedRect: &frame, context: nil, hints: nil)
+        else { return }
+        context.saveGState()
+        context.draw(picture, in: bounds)
+        context.restoreGState()
     }
 }

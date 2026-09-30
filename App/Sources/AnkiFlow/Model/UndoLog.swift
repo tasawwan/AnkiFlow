@@ -1,15 +1,24 @@
 import Foundation
 
-/// The undo history for a whole library, kept in `.ankiflow/undo.json`.
+/// The undo history for a whole library, for as long as the app is running.
 ///
-/// Library-wide rather than per lecture, and on disk rather than in memory:
-/// undo should reach back past a lecture switch and past quitting the app,
-/// because "I closed it and lost my undo" is the same class of surprise as
-/// having no undo at all.
+/// Library-wide rather than per lecture, so undo reaches back past a lecture
+/// switch -- but **not** past quitting. It used to be written to
+/// `.ankiflow/undo.json` and reloaded at launch, and that was the wrong call:
+/// pressing Undo on a freshly opened app and having a change from three days
+/// ago come back is a worse surprise than having nothing to undo. Every stack
+/// in this app is now session-scoped, which makes one rule instead of four:
+/// closing the app is a clean slate.
 ///
-/// It is deliberately not in the sidecars. A sidecar describes one lecture's
-/// questions; the history of what you did to them is about the session, not the
-/// lecture, and writing it there would rewrite every question file on every
+/// What that costs is the ability to take back a deletion you only notice the
+/// next day, and the answer to that is not undo. Lectures are trashed to the
+/// system Trash and come back from there; a question file is plain readable
+/// JSON; and orphan recovery reunites a sidecar with its PDF. Undo is for the
+/// mistake you notice while you are still working.
+///
+/// It is deliberately not in the sidecars either. A sidecar describes one
+/// lecture's questions; the history of what you did to them is about the
+/// session, and writing it there would rewrite every question file on every
 /// keystroke-sized action.
 @MainActor
 final class UndoLog: ObservableObject {
@@ -44,14 +53,9 @@ final class UndoLog: ObservableObject {
     /// Enough to cover a working session without the file becoming a burden.
     private let depth = 40
     private let root: URL
-    private let fileURL: URL
-    private var saveTask: Task<Void, Never>?
 
     init(libraryRoot: URL) {
         self.root = libraryRoot
-        self.fileURL = LibraryPaths.dotDirectory(inLibrary: libraryRoot)
-            .appendingPathComponent("undo.json")
-        load()
     }
 
     // MARK: - Recording
@@ -65,7 +69,6 @@ final class UndoLog: ObservableObject {
         if undoStack.count > depth { undoStack.removeFirst() }
         // A new action ends the redo branch, the same as every other editor.
         redoStack.removeAll()
-        scheduleSave()
     }
 
     /// Records a trashing, which has no question snapshot to speak of.
@@ -74,7 +77,6 @@ final class UndoLog: ObservableObject {
         undoStack.append(Step(label: label, lecture: "", before: [], after: [], trashed: files))
         if undoStack.count > depth { undoStack.removeFirst() }
         redoStack.removeAll()
-        scheduleSave()
     }
 
     /// Redoing a trashing puts the files somewhere new, so the step has to learn
@@ -82,7 +84,6 @@ final class UndoLog: ObservableObject {
     func updateLatestTrash(_ files: [TrashedFile]) {
         guard let index = undoStack.indices.last else { return }
         undoStack[index].trashed = files
-        scheduleSave()
     }
 
     // MARK: - Moving through it
@@ -96,14 +97,12 @@ final class UndoLog: ObservableObject {
         guard let step = undoStack.popLast() else { return nil }
         redoStack.append(step)
         if redoStack.count > depth { redoStack.removeFirst() }
-        scheduleSave()
         return (step, absolute(step.lecture))
     }
 
     func popRedo() -> (step: Step, lecture: URL)? {
         guard let step = redoStack.popLast() else { return nil }
         undoStack.append(step)
-        scheduleSave()
         return (step, absolute(step.lecture))
     }
 
@@ -133,41 +132,7 @@ final class UndoLog: ObservableObject {
         for index in redoStack.indices where redoStack[index].lecture == oldPath {
             redoStack[index].lecture = newPath
         }
-        scheduleSave()
     }
 
     // MARK: - Disk
-
-    private struct File: Codable {
-        var undo: [Step]
-        var redo: [Step]
-    }
-
-    private func load() {
-        guard let data = try? Data(contentsOf: fileURL) else { return }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let file = try? decoder.decode(File.self, from: data) else { return }
-        undoStack = file.undo
-        redoStack = file.redo
-    }
-
-    private func scheduleSave() {
-        saveTask?.cancel()
-        saveTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            guard !Task.isCancelled else { return }
-            self?.save()
-        }
-    }
-
-    private func save() {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.withoutEscapingSlashes]
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(File(undo: undoStack, redo: redoStack)) else { return }
-        try? FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: fileURL, options: .atomic)
-    }
 }

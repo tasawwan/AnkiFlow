@@ -32,6 +32,9 @@ struct ExportSheet: View {
     @State private var showReset = false
     @State private var resetScope: ResetScope = .lecture
     @State private var confirmingReset = false
+    @State private var confirmingPackage = false
+    @State private var confirmingMove = false
+    @State private var movedOffered = false
     @State private var resetResult: String?
 
     var body: some View {
@@ -54,6 +57,28 @@ struct ExportSheet: View {
         // browser, an error to paste to whoever can fix it.
         .textSelection(.enabled)
         .onAppear { probeAnki() }
+        .alert("Export a package instead?", isPresented: $confirmingPackage) {
+            Button("Save package anyway", role: .destructive) {
+                guard let library = state.library else { return }
+                // Off the alert's own dismissal: running a modal save panel
+                // from inside the action that closes the alert leaves the
+                // panel behind a sheet that is still going away.
+                DispatchQueue.main.async { runPackage(library: library) }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text(packageAlertMessage)
+        }
+        .alert("Re-point these decks?", isPresented: $confirmingMove) {
+            Button("Move the cards", role: .destructive) {
+                guard let summary else { return }
+                movedOffered = true
+                moveCards(summary.offeredMoves)
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text(moveAlertMessage)
+        }
     }
 
     // MARK: - Before
@@ -88,8 +113,13 @@ struct ExportSheet: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            // Shown even after the picker has fallen back to .package: the
-            // fallback is the reason you want to read it.
+            if destination == .package {
+                packageWarning
+            }
+
+            // Shown whenever the port is dead and the chosen destination needs
+            // it -- which now includes the case where .anki is still selected
+            // and can't run, because nothing switches away from it any more.
             if ankiReachable == false, destination != .archive {
                 ankiTrouble
             }
@@ -108,9 +138,9 @@ struct ExportSheet: View {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button(running ? "Rendering slides…" : "Export…") { run() }
+                Button(running ? "Rendering slides…" : exportButtonLabel) { run() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(running)
+                    .disabled(running || (destination == .anki && ankiReachable == false))
             }
         }
     }
@@ -172,7 +202,7 @@ struct ExportSheet: View {
         switch resetScope {
         case .lecture: return state.document?.title ?? "this lecture"
         case .folder:
-            let folder = state.document?.pdfURL.deletingLastPathComponent().lastPathComponent
+            let folder = state.document?.pdfURL.deletingLastPathComponent().finderName
             return folder ?? "this folder"
         case .library: return state.library?.name ?? "this library"
         }
@@ -195,15 +225,30 @@ struct ExportSheet: View {
                 stat("\(summary.mediaFiles)", "slides", .secondary)
             }
 
-            GroupBox {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("When Anki asks:").font(.callout.weight(.semibold))
-                    Label("Update notes — **If newer** (the default)", systemImage: "checkmark")
-                    Label("Merge notetypes — **on**", systemImage: "checkmark")
-                    Label("Import any learning progress — off (either is safe)", systemImage: "minus")
+            // Only the package puts an import screen in front of you. Sending
+            // straight into Anki answers all three of these itself, and showing
+            // instructions for a dialog that never appears made the safe path
+            // look like the fiddly one.
+            if destination == .package {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("When Anki asks:").font(.callout.weight(.semibold))
+                        Label("Update notes — **If newer** (the default)", systemImage: "checkmark")
+                        Label("Merge notetypes — **on**", systemImage: "checkmark")
+                        Label("Import any learning progress — off (either is safe)", systemImage: "minus")
+                    }
+                    .font(.callout)
+                    .padding(4)
                 }
-                .font(.callout)
-                .padding(4)
+            }
+
+            if summary.mediaRemoved > 0 {
+                Text(summary.mediaRemoved == 1
+                     ? "One slide image nothing pointed at any more was removed from Anki's media folder."
+                     : "\(summary.mediaRemoved) slide images nothing pointed at any more were removed from Anki's media folder.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Text("Your review history on existing cards is preserved. Only the \(summary.changedNotes) changed \(summary.changedNotes == 1 ? "note" : "notes") will be rewritten.")
@@ -223,18 +268,28 @@ struct ExportSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if !summary.moved.isEmpty {
+            // Applied, not offered -- so this is a report, not a request.
+            if !summary.moved.filter(\.isAutomatic).isEmpty {
+                let done = summary.moved.filter(\.isAutomatic).count
+                Text("\(done) lecture\(done == 1 ? "" : "s") sat higher in the tree than \(done == 1 ? "its folder now says" : "their folders now say"). \(done == 1 ? "Its deck was" : "Their decks were") moved down to match — nothing about the names disagreed, only how much of the path the last export could see.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !summary.offeredMoves.isEmpty {
+                let offered = summary.offeredMoves.count
                 disclosure(
-                    title: "\(summary.moved.count) lecture\(summary.moved.count == 1 ? "" : "s") moved folder",
-                    explanation: "Anki never moves existing cards between decks on import. Paste this into the Anki browser, select all, then Change Deck.",
+                    title: "\(offered) lecture\(offered == 1 ? "" : "s") no longer \(offered == 1 ? "matches its" : "match their") deck",
+                    explanation: "A folder was renamed, or a lecture moved between folders — the two names disagree about something they both know, so this isn't AnkiFlow's call to make. The export went where the cards already are. With Anki running, the button below re-points them; otherwise paste this into the browser, select all, then Change Deck.",
                     searches: summary.moveSearches().map { SearchRow(destination: $0.to, search: $0.search) }
                 )
                 if ankiReachable == true {
                     HStack(spacing: 10) {
                         Button(movingCards ? "Moving…" : "Move them in Anki") {
-                            moveCards(summary.moved.map(\.to))
+                            confirmingMove = true
                         }
-                        .disabled(movingCards || movedCards != nil)
+                        .disabled(movingCards || movedOffered)
                         if let movedCards {
                             Text(movedCards == 0
                                  ? "Nothing needed moving."
@@ -347,11 +402,12 @@ struct ExportSheet: View {
                 ankiSituation = AnkiApp.Situation.current
                 copiedAddOnCode = false
             }
-            // Straight into Anki is the first option and the default, but only
-            // when it can actually work -- offering it selected while Anki is
-            // closed would make the obvious action the failing one. The notice
-            // below stays visible either way, so the switch is never silent.
-            if !reachable, destination == .anki { destination = .package }
+            // Straight into Anki stays selected even when the port is dead.
+            // Falling back to the package on its own was the wrong instinct:
+            // the package is the destination with permanent consequences, and
+            // quietly steering someone into it because Anki happened to be
+            // closed is exactly how you end up with cards stranded in the wrong
+            // deck. The notice below says what is wrong and offers the fix.
         }
     }
 
@@ -401,19 +457,63 @@ struct ExportSheet: View {
         }
     }
 
-    private func moveCards(_ decks: [String]) {
+    private func moveCards(_ moves: [DeckMove]) {
         movingCards = true
         Task {
             defer { movingCards = false }
+            // Only the offered moves report a count -- the automatic ones ran
+            // before this sheet appeared, and a number under the button would
+            // read as if it had already been pressed.
+            movedCards = await applyMoves(moves)
+        }
+    }
+
+    /// Moves each lecture's cards, re-pins it, and clears up the deck it left.
+    ///
+    /// Per lecture rather than in one sweep, so a failure halfway through leaves
+    /// the ones that did move correctly recorded rather than rolling the whole
+    /// thing back into an inconsistent state.
+    @discardableResult
+    private func applyMoves(_ moves: [DeckMove]) async -> Int {
+        guard !moves.isEmpty else { return 0 }
+        var total = 0
+        for move in moves {
             do {
-                var total = 0
-                for deck in Set(decks) {
-                    total += try await AnkiConnect.moveCards(to: deck)
-                }
-                movedCards = total
+                total += try await AnkiConnect.moveCards(from: move.from, to: move.to)
+                repin(move.url, to: move.to)
+                // Only ever removes a deck that has nothing left in it at all.
+                await AnkiConnect.deleteDeckIfEmpty(move.from)
             } catch {
                 errorMessage = error.localizedDescription
+                break
             }
+        }
+        return total
+    }
+
+    /// Records a lecture's new deck in its own sidecar -- the open document if
+    /// that is the one, otherwise the file on disk.
+    private func repin(_ url: URL, to deck: String) {
+        if let document = state.document, document.pdfURL == url {
+            document.recordExport(deckName: deck)
+            document.saveNow()
+            return
+        }
+        let sidecar = url.deletingPathExtension()
+            .appendingPathExtension(AnkiIdentity.sidecarExtension)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: sidecar),
+              var file = try? decoder.decode(SidecarFile.self, from: data) else { return }
+        file.lastExportedDeckName = deck
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        if let encoded = try? encoder.encode(file) {
+            // Same as `writeBack`: an atomic write replaces the file, so the
+            // hidden flag has to be put back or the question file reappears.
+            try? AtomicWrite.write(encoded, to: sidecar,
+                                   hidden: state.library?.settings.hideSidecarFiles ?? true)
         }
     }
 
@@ -493,11 +593,94 @@ struct ExportSheet: View {
         }
     }
 
+    /// The deck name with the root taken off and the separators made readable.
+    ///
+    /// Guarded, because the root is allowed to be empty now: interpolating an
+    /// empty one gives a pattern of "::", which strips every separator in the
+    /// name and glues the whole path into one word.
+    static func sourceLabel(for deckName: String, under root: String) -> String {
+        var trimmed = deckName
+        if !root.isEmpty, trimmed.hasPrefix(root + "::") {
+            trimmed.removeFirst(root.count + 2)
+        }
+        return trimmed.replacingOccurrences(of: "::", with: " / ")
+    }
+
+    /// Deliberately loud. A package is not a lesser version of sending straight
+    /// into Anki -- it is a one-way door for the two things this app can't do
+    /// through it, and someone who picks it because it sounds simpler should
+    /// find that out here rather than three weeks of reviews later.
+    @ViewBuilder
+    private var packageWarning: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("A package can't move or delete anything", systemImage: "exclamationmark.triangle.fill")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(Theme.retired)
+
+            ForEach(Self.packageCaveats, id: \.self) { line in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("•")
+                    Text(line).fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.retired.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Theme.retired.opacity(0.45), lineWidth: 1)
+        )
+    }
+
+    private static let packageCaveats = [
+        "Anki never moves a card that already exists. Rename a folder, change the deck root, reorganise anything — importing a package leaves those cards in the old deck forever. Sending straight into Anki can re-point them; this can't.",
+        "Retiring a question here does nothing to the card in Anki. Only a live connection can delete notes, so retired cards keep coming up in reviews until you hunt them down in the browser.",
+        "The import screen is yours to get wrong. The wrong duplicate setting, or importing an old package on top of a newer one, and you get doubled notes or overwritten edits with no undo.",
+        "Nothing confirms what landed. If the import half-fails, this app still records the export as done and skips those notes next time.",
+    ]
+
+    /// Whether this export can actually re-point cards that already exist.
+    /// Only a live connection can; a package cannot, and pretending otherwise
+    /// is how a lecture ends up in two decks at once.
+    private var canMoveCards: Bool {
+        destination == .anki && ankiReachable == true
+    }
+
+    private var exportButtonLabel: String {
+        destination == .package ? "Save package…" : "Export…"
+    }
+
+    /// The one way this offer can be wrong is worth naming out loud: opening
+    /// the same library from a different folder makes every lecture compute a
+    /// different deck, and accepting would restructure the whole collection to
+    /// match a view you didn't mean to make permanent.
+    private var moveAlertMessage: String {
+        let moves = summary?.offeredMoves ?? []
+        let count = moves.count
+        let examples = moves.prefix(3)
+            .map { "\($0.from)\n  → \($0.to)" }
+            .joined(separator: "\n")
+        let more = count > 3 ? "\n…and \(count - 3) more." : ""
+        return "\(count) lecture\(count == 1 ? "" : "s") will have \(count == 1 ? "its" : "their") cards moved in Anki:\n\n\(examples)\(more)\n\nIf that isn't what you expected — if you opened this library from a different folder than usual — cancel. Your decks are fine as they are, and the next export will keep sending cards where they already live."
+    }
+
+    private var packageAlertMessage: String {
+        "Anki is \(ankiReachable == true ? "running and answering right now" : "the safer route once it's open"). Sending straight into it is the only way this app can move cards to a renamed deck or delete a retired question — a package can do neither, and that can't be fixed afterwards by importing again.\n\nIf you're moving cards to another computer or keeping a backup, a package is the right tool. Otherwise, close this and use Straight into Anki."
+    }
+
     private var destinationExplanation: String {
-        let root = state.library?.settings.resolvedDeckRoot ?? AnkiIdentity.deckRoot
+        // The top level as it will actually read: the root when there is one,
+        // otherwise the library's own name, which is then the top.
+        let configured = state.library?.settings.resolvedDeckRoot ?? ""
+        let root = configured.isEmpty
+            ? (state.library?.name ?? AnkiIdentity.deckRoot)
+            : configured
         switch destination {
         case .package:
-            return "One .apkg you open in Anki. Folder structure becomes deck structure under \(root)::."
+            return "One .apkg you open in Anki by hand. Folder structure becomes deck structure under \(root):: — but only for cards Anki hasn't seen before."
         case .anki:
             return "The same .apkg, handed straight to a running Anki — no save dialog, no import screen. Identical cards; it only skips the paperwork."
         case .archive:
@@ -516,7 +699,12 @@ struct ExportSheet: View {
             runToAnki(library: library)
             return
         }
+        // The package needs a yes of its own. It is the only destination whose
+        // mistakes can't be undone by exporting again.
+        confirmingPackage = true
+    }
 
+    private func runPackage(library: Library) {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = defaultFileName(library: library)
         panel.allowedContentTypes = []
@@ -580,7 +768,15 @@ struct ExportSheet: View {
                 // taken the package: recording a successful export that never
                 // arrived would make the next one skip those notes as unchanged.
                 for plan in updated { writeBack(plan) }
-                summary = result
+                // The formalities, applied before the sheet is shown: these
+                // are the ones with nothing to decide, and the export already
+                // sent their new cards to the new name.
+                await applyMoves(result.moved.filter(\.isAutomatic))
+                // After the move, not before: a card that has just been
+                // re-pointed still has to be counted as using its pictures.
+                var settled = result
+                settled.mediaRemoved = await AnkiConnect.deleteUnusedMedia()
+                summary = settled
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -608,7 +804,8 @@ struct ExportSheet: View {
                 running = false
                 return
             }
-            let archiver = ArchiveExporter(libraryRoot: library.root)
+            let archiver = ArchiveExporter(libraryRoot: library.root,
+                                           settingsFile: SettingsStore.shared.fileURL)
             archiveResult = try archiver.export(lectures: urls, to: target)
             if let url = archiveResult?.url {
                 NSWorkspace.shared.activateFileViewerSelecting([url])
@@ -687,8 +884,6 @@ struct ExportSheet: View {
                 sha = LectureDocument.sha256OfFile(at: url)
             }
 
-            let deckName = library.deckName(for: url)
-
             let previousDeck: String?
             let retired: [String]
             if state.document?.pdfURL == url, let open = state.document {
@@ -703,17 +898,69 @@ struct ExportSheet: View {
                 retired = []
             }
 
+            // A lecture's deck is decided once and then remembered.
+            //
+            // The computed name is built from the lecture's path *relative to
+            // the library root*, and the root is whichever folder you happened
+            // to open. Open the same lecture from `Lecture Materials` one day
+            // and from `Block 2` the next and it computes two different decks --
+            // and since Anki never moves a card that already exists, the cards
+            // you had stay put while new ones go somewhere else, quietly
+            // splitting the tree in two. The path tag did the same.
+            //
+            // So once a lecture has been exported, where it went is the answer,
+            // and the folder you are looking at it from stops mattering.
+            //
+            // Genuinely reorganising your folders is then a disagreement rather
+            // than a silent split: the export still goes where the cards are,
+            // and the summary offers to re-point them, which only a live Anki
+            // can actually do.
+            let computed = library.deckName(for: url)
+            let deckName: String
+            let drifted: String?
+            let automatic: Bool
+            if let previousDeck {
+                switch DeckPath.reconcile(pinned: previousDeck, computed: computed,
+                                          root: library.settings.resolvedDeckRoot) {
+                case .same(let name):
+                    deckName = name; drifted = nil; automatic = false
+                case .narrowed(let name):
+                    // You opened a subfolder. The folders know less than the
+                    // last export did, which is not news about where the cards
+                    // belong -- keep the fuller name and say nothing.
+                    deckName = name; drifted = nil; automatic = false
+                case .extended(_, let to):
+                    // Only a live Anki can move the cards that are already
+                    // there. Sending a package to the new name while the old
+                    // cards stay put is precisely the split this mechanism
+                    // exists to prevent, so a package export stays where the
+                    // cards are and reports the move instead of making one.
+                    if canMoveCards {
+                        deckName = to; drifted = to; automatic = true
+                    } else {
+                        deckName = previousDeck; drifted = to; automatic = false
+                    }
+                case .diverged(_, let to):
+                    deckName = previousDeck; drifted = to; automatic = false
+                }
+            } else {
+                deckName = computed; drifted = nil; automatic = false
+            }
+
             return LecturePlan(
                 pdfURL: url,
                 pdfSha256: sha,
                 deckName: deckName,
-                pathTag: library.pathTag(for: url),
-                sourceLabel: deckName
-                    .replacingOccurrences(of: "\(library.settings.resolvedDeckRoot)::", with: "")
-                    .replacingOccurrences(of: "::", with: " / "),
+                // From the deck it is actually going to, not from the path --
+                // or the tag would still flip with the folder you opened.
+                pathTag: deckName.replacingOccurrences(of: " ", with: "-"),
+                sourceLabel: Self.sourceLabel(for: deckName,
+                                              under: library.settings.resolvedDeckRoot),
                 document: pdf,
                 questions: questions.filter { !$0.isEmpty },
                 previousDeckName: previousDeck,
+                driftedTo: drifted,
+                driftIsAutomatic: automatic,
                 retiredQIDs: retired
             )
         }

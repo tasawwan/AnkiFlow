@@ -13,6 +13,9 @@ struct SidebarView: View {
     @Environment(\.palette) private var palette
 
     @State private var expanded: Set<String> = []
+    /// Set when something has moved the tree enough that where you are looking
+    /// is no longer where you were. Cleared once the scroll has happened.
+    @State private var scrollTarget: String?
 
     /// One visible line of the tree.
     ///
@@ -25,6 +28,47 @@ struct SidebarView: View {
         let node: LibraryNode
         let depth: Int
         var id: String { node.id }
+    }
+
+    /// Every folder in the tree, at any depth. Opening "all" has to mean all
+    /// of them, including the ones you cannot see to click while their parent
+    /// is shut.
+    private func folderIDs(_ nodes: [LibraryNode]) -> [String] {
+        nodes.flatMap { node -> [String] in
+            guard node.isFolder else { return [] }
+            return [node.id] + folderIDs(node.children)
+        }
+    }
+
+    private func hasFolders(_ library: Library) -> Bool {
+        !folderIDs(library.tree).isEmpty
+    }
+
+    private func allExpanded(_ library: Library) -> Bool {
+        let all = folderIDs(library.tree)
+        return !all.isEmpty && all.allSatisfy(expanded.contains)
+    }
+
+    /// Open everything, or shut everything.
+    ///
+    /// One button rather than two, reading the tree's current state the way the
+    /// fold control in the notes editor does: when anything is still shut it
+    /// opens, and only once the whole tree is open does it offer to close it.
+    /// Partly-open is the common state and "open the rest" is what you want
+    /// from it far more often than "close what I opened".
+    private func toggleAllFolders(_ library: Library) {
+        let all = folderIDs(library.tree)
+        withAnimation(.easeOut(duration: 0.12)) {
+            if all.allSatisfy(expanded.contains) {
+                expanded.removeAll()
+            } else {
+                expanded.formUnion(all)
+                // Opening every folder in a curriculum-sized library puts two
+                // hundred rows on screen and leaves you at the top of them,
+                // which is the one place the lecture you are reading is not.
+                scrollTarget = state.document?.pdfURL.path
+            }
+        }
     }
 
     private func flatten(_ nodes: [LibraryNode], depth: Int = 0) -> [Row] {
@@ -55,12 +99,17 @@ struct SidebarView: View {
     @State private var creating: NewFolder?
     /// The folder row currently under a drag.
     @State private var dropTarget: String?
+    /// The topic panel's share of the sidebar, draggable like the notes divider
+    /// on the other side of the window.
+    @State private var topicsHeight: CGFloat = 240
+    @State private var topicsDragFrom: CGFloat?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let library = state.library {
                 header(library)
                 Divider().overlay(palette.line)
+                ScrollViewReader { scroller in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
                         ForEach(flatten(library.tree)) { row in
@@ -68,6 +117,7 @@ struct SidebarView: View {
                                 folderRow(row.node, depth: row.depth)
                             } else {
                                 lectureRow(row.node, depth: row.depth)
+                                    .id(row.node.id)
                             }
                         }
                         // Right-clicking below the last row means the library
@@ -89,6 +139,21 @@ struct SidebarView: View {
                     }
                     .padding(.vertical, 8)
                 }
+                .onChange(of: scrollTarget) { _, target in
+                    guard let target else { return }
+                    // After the rows the expansion added have been laid out --
+                    // scrolling to a row that does not exist yet does nothing.
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            scroller.scrollTo(target, anchor: .center)
+                        }
+                        scrollTarget = nil
+                    }
+                }
+                }
+                topicsDivider
+                TopicsPanel()
+                    .frame(height: topicsHeight)
             } else {
                 emptyState
                 Spacer(minLength: 0)
@@ -131,6 +196,36 @@ struct SidebarView: View {
         }
     }
 
+    /// The grab strip between the lecture tree and the topics. One pixel of
+    /// line with a taller invisible target over it, so it can be caught without
+    /// the sidebar growing a visible gutter.
+    private var topicsDivider: some View {
+        Rectangle()
+            .fill(palette.line)
+            .frame(height: 1)
+            .overlay(
+                Color.clear
+                    .frame(height: 9)
+                    .contentShape(Rectangle())
+                    .onHover { inside in
+                        if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+                    }
+                    .gesture(
+                        DragGesture()
+                            .onChanged { move in
+                                // Anchored to where the drag started: the
+                                // translation is measured from there, so
+                                // subtracting it from the live height each event
+                                // would compound and the panel would run away.
+                                let from = topicsDragFrom ?? topicsHeight
+                                if topicsDragFrom == nil { topicsDragFrom = topicsHeight }
+                                topicsHeight = min(560, max(120, from - move.translation.height))
+                            }
+                            .onEnded { _ in topicsDragFrom = nil }
+                    )
+            )
+    }
+
     private func header(_ library: Library) -> some View {
         HStack(spacing: 6) {
             Text(library.name)
@@ -139,9 +234,23 @@ struct SidebarView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 4)
+
+            if hasFolders(library) {
+                Button {
+                    toggleAllFolders(library)
+                } label: {
+                    Image(systemName: allExpanded(library)
+                          ? "chevron.down.square" : "chevron.right.square")
+                        .font(.system(size: 11))
+                        .foregroundStyle(palette.dim)
+                }
+                .buttonStyle(.plain)
+                .help(allExpanded(library) ? "Collapse every folder" : "Open every folder")
+            }
         }
-        // No buttons. The library watches its folder, so there is nothing to
-        // refresh; making a folder is a right-click, like it is in Finder.
+        // One button, and only when there is a folder to open. The library
+        // watches its own folder so there is nothing to refresh, and making a
+        // folder is a right-click the way it is in Finder.
         .contentShape(Rectangle())
         .contextMenu { rootMenu(library) }
         // The leading inset the old sidebar was missing, which is why the
@@ -188,6 +297,17 @@ struct SidebarView: View {
     }
 
     private func lectureRow(_ node: LibraryNode, depth: Int) -> some View {
+        // The dot sits over the row rather than inside its button. Nesting one
+        // button in another leaves the two arguing over the click, which is a
+        // bug that shows up as "sometimes it opens the lecture instead".
+        HStack(spacing: 0) {
+            lectureButton(node, depth: depth)
+            stateDot(for: node.url)
+                .padding(.trailing, 10)
+        }
+    }
+
+    private func lectureButton(_ node: LibraryNode, depth: Int) -> some View {
         let isOpen = state.document?.pdfURL == node.url
         let count = questionCount(for: node.url)
         return Button {
@@ -212,7 +332,7 @@ struct SidebarView: View {
             }
             .padding(.vertical, 4)
             .padding(.leading, CGFloat(11 + depth * 14))
-            .padding(.trailing, 12)
+            .padding(.trailing, 4)
             .background(isOpen ? palette.amber.opacity(0.10) : Color.clear)
             .contentShape(Rectangle())
         }
@@ -237,7 +357,7 @@ struct SidebarView: View {
         Button("Reveal in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting([node.url])
         }
-        // No confirmation: it goes to the Trash, and ⌘U puts it straight back.
+        // No confirmation: it goes to the Trash, and ⌘Z puts it straight back.
         Button("Move to Trash") {
             state.trash(node.url, isFolder: false, name: node.name)
         }
@@ -310,13 +430,64 @@ struct SidebarView: View {
     /// Cheap read of the sidecar so the sidebar can show how many questions a
     /// lecture already has without opening it.
     private func questionCount(for pdfURL: URL) -> Int? {
-        if state.document?.pdfURL == pdfURL { return state.document?.questions.count }
+        sidecarQuestions(for: pdfURL)?.count
+    }
+
+    private func sidecarQuestions(for pdfURL: URL) -> [Question]? {
+        if state.document?.pdfURL == pdfURL { return state.document?.questions }
         let sidecar = pdfURL.deletingPathExtension()
             .appendingPathExtension(AnkiIdentity.sidecarExtension)
         guard let data = try? Data(contentsOf: sidecar) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode(SidecarFile.self, from: data))?.questions.count
+        return (try? decoder.decode(SidecarFile.self, from: data))?.questions
+    }
+
+    /// Red, amber, green beside the count: nothing written, something still to
+    /// do, or done and drilled. Nothing at all for a lecture with no question
+    /// file -- an absent dot says "not started" more quietly than a red one, and
+    /// most of a fresh library is in that state.
+    @ViewBuilder
+    private func stateDot(for pdfURL: URL) -> some View {
+        let questions = sidecarQuestions(for: pdfURL) ?? []
+        let reviewed = state.isReviewed(pdfURL)
+        let condition = state.lectureState(for: pdfURL, questions: questions,
+                                           reviewed: reviewed)
+        Button {
+            state.toggleReviewed(pdfURL)
+        } label: {
+            Circle()
+                .fill(colour(for: condition))
+                .frame(width: 7, height: 7)
+                .overlay(
+                    // A ring around the one you ticked yourself, so "I have
+                    // learned this" is distinguishable from "Anki has nothing
+                    // new left", which are different claims.
+                    Circle()
+                        .strokeBorder(palette.ink.opacity(reviewed ? 0.45 : 0), lineWidth: 1)
+                        .frame(width: 11, height: 11)
+                )
+                .frame(width: 13, height: 13)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(reviewed ? "Marked learned — click to unmark" : help(for: condition))
+    }
+
+    private func colour(for condition: AppState.LectureState) -> Color {
+        switch condition {
+        case .untouched:  return Color(red: 0.710, green: 0.329, blue: 0.369)
+        case .inProgress: return palette.amber
+        case .learned:    return Color(red: 0.243, green: 0.612, blue: 0.427)
+        }
+    }
+
+    private func help(for condition: AppState.LectureState) -> String {
+        switch condition {
+        case .untouched:  return "No questions yet"
+        case .inProgress: return "Questions still to write or export"
+        case .learned:    return "Every card exported, and none new in Anki"
+        }
     }
 
     private var emptyState: some View {

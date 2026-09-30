@@ -77,7 +77,7 @@ def make_questions():
          "front": "Explain the classical pathway, including the proteins involved.",
          "back": "", "questionPages": [], "answerPages": [12, 13, 14, 15, 16, 17, 18],
          "tags": ["high-yield"], "blanks": {}, "export": None},
-        {"qid": "01JBQZ4A1B2C3D4E5F6G7H8J9K", "kind": "slide2slide",
+        {"qid": "01JBQZ4A1B2C3D4E5F6G7H8J9K", "kind": "basic",
          "front": "Which step here is rate-limiting, and what regulates it?",
          "back": "", "questionPages": [24], "answerPages": [25, 26, 27],
          "tags": [], "blanks": {}, "export": None},
@@ -116,7 +116,7 @@ def main():
     check("path tag applied", any("Lecture-04" in t for t in q1["tags"]), str(q1["tags"]))
     check("source line rendered", "pp. 12–18" in q1["source"], q1["source"])
     q2 = after1["01JBQZ4A1B2C3D4E5F6G7H8J9K"]
-    check("slide2slide has text AND slides on the front",
+    check("a card can carry text AND slides on the front",
           "rate-limiting" in q2["front"] and q2["front_media"].count("<img") == 1,
           f'front={q2["front"][:40]!r} media={q2["front_media"]!r}')
     check("media files written", s1["media"] == 11, f'{s1["media"]} files')

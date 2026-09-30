@@ -2,6 +2,53 @@ import Foundation
 import AppKit
 import PDFKit
 
+extension Notification.Name {
+    static let pdfEditSessionDidChange = Notification.Name("AnkiFlow.pdfEditSessionDidChange")
+}
+
+/// Where a page went when the lecture was replaced underneath the session.
+///
+/// An undo step is a closure, and a closure that says "put this mark back on
+/// that page" holds the page object itself. Reload the PDF and every page
+/// object is replaced, so that closure would go on faithfully adding the mark
+/// to a document nobody is looking at. Routing page work through here means
+/// the page is looked up when the step *runs* rather than when it was
+/// recorded, which is the whole of what lets an edit history survive a merge.
+///
+/// The old page is kept alive alongside its replacement deliberately: the
+/// table is keyed by object identity, and a deallocated page would let a
+/// later allocation land on the same address and inherit its redirection.
+final class PDFPageBinding {
+    /// A binding that redirects nothing, for call sites with no session.
+    static let identity = PDFPageBinding()
+
+    private var moved: [ObjectIdentifier: (old: PDFPage, new: PDFPage)] = [:]
+
+    func resolve(_ page: PDFPage) -> PDFPage { moved[ObjectIdentifier(page)]?.new ?? page }
+
+    /// Point everything that referred to `old` at `new`, including references
+    /// an earlier reload had already redirected here.
+    func rebind(_ old: PDFPage, to new: PDFPage) {
+        guard old !== new else { return }
+        for (key, entry) in moved where entry.new === old {
+            moved[key] = (old: entry.old, new: new)
+        }
+        moved[ObjectIdentifier(old)] = (old: old, new: new)
+    }
+
+    func add(_ annotation: PDFAnnotation, to page: PDFPage) {
+        resolve(page).addAnnotation(annotation)
+    }
+
+    func remove(_ annotation: PDFAnnotation, from page: PDFPage) {
+        resolve(page).removeAnnotation(annotation)
+    }
+
+    func setBounds(_ rect: CGRect, for box: PDFDisplayBox, on page: PDFPage) {
+        resolve(page).setBounds(rect, for: box)
+    }
+}
+
 /// The state of an editing session on one lecture PDF: what has been changed,
 /// what can be undone, and whether any of it has reached the disk yet.
 ///
@@ -13,7 +60,7 @@ import PDFKit
 /// document back the way it was, and nothing has to be un-written.
 ///
 /// Undo is a pair of stacks of closures rather than an `UndoManager`. AppKit's
-/// undo manager is shared with every text field in the window, and the app's ⌘U
+/// undo manager is shared with every text field in the window, and the app's ⌘Z
 /// already means "undo the last thing I did to my questions"; a private stack
 /// keeps the two from stealing each other's keystrokes.
 @MainActor
@@ -25,14 +72,19 @@ final class PDFEditSession: ObservableObject {
         let redo: () -> Void
     }
 
-    let document: PDFDocument
+    private(set) var document: PDFDocument
     let url: URL
+
+    /// The redirection every undo step's page work goes through, so the
+    /// history keeps working when the lecture is replaced under it.
+    let pages = PDFPageBinding()
 
     @Published private(set) var hasUnsavedChanges = false
     @Published private(set) var undoLabel: String?
     @Published private(set) var redoLabel: String?
     /// The annotation currently selected, if any, and the page it sits on.
     @Published var selection: Selection?
+    @Published var selections: [Selection] = []
 
     struct Selection: Equatable {
         let annotation: PDFAnnotation
@@ -53,17 +105,107 @@ final class PDFEditSession: ObservableObject {
     /// that by comparing against this snapshot means undo only has to put the
     /// box back -- the list of what changed recomputes itself, with no map to
     /// keep in step with the stacks.
-    private let originalBoxes: [Int: CGRect]
+    private var originalBoxes: [Int: CGRect]
+
+    /// Which annotations each page already had when editing began.
+    ///
+    /// The difference between this and the document now *is* the unsaved work,
+    /// which is what lets the marks be replayed onto a newer copy of the lecture
+    /// when one syncs in from somewhere else. Identities rather than copies:
+    /// nothing is duplicated, this is just a record of what was already there.
+    private var originalAnnotations: [Int: Set<ObjectIdentifier>]
+
+    /// The unsaved work, as something that can be carried to another document.
+    struct PendingMarks {
+        /// Marks you have made, by the page number they are on.
+        var added: [(page: Int, annotation: PDFAnnotation)] = []
+        /// Marks you have deleted, described well enough to find again.
+        var removed: [(page: Int, type: String, bounds: CGRect)] = []
+
+        var isEmpty: Bool { added.isEmpty && removed.isEmpty }
+    }
+
+    func pendingMarks() -> PendingMarks {
+        var out = PendingMarks()
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index) else { continue }
+            let number = index + 1
+            let before = originalAnnotations[number] ?? []
+            var stillThere = Set<ObjectIdentifier>()
+            for annotation in page.annotations {
+                let id = ObjectIdentifier(annotation)
+                stillThere.insert(id)
+                if !before.contains(id) { out.added.append((number, annotation)) }
+            }
+            for id in before.subtracting(stillThere) {
+                guard let gone = originalIndex[id] else { continue }
+                out.removed.append((number, gone.type, gone.bounds))
+            }
+        }
+        return out
+    }
+
+    /// What each remembered annotation looked like, so a deleted one can be
+    /// matched in a document where the object itself does not exist.
+    private var originalIndex: [ObjectIdentifier: (type: String, bounds: CGRect)]
+
+    /// A document as it stood before anyone edited it -- the thing the unsaved
+    /// work is measured against. Taken separately from the session so a reload
+    /// can snapshot the newly-loaded file *before* replaying marks onto it,
+    /// which is the only moment the clean state exists.
+    struct Baseline {
+        var boxes: [Int: CGRect] = [:]
+        var annotations: [Int: Set<ObjectIdentifier>] = [:]
+        var index: [ObjectIdentifier: (type: String, bounds: CGRect)] = [:]
+
+        init() {}
+
+        init(of document: PDFDocument) {
+            for offset in 0..<document.pageCount {
+                guard let page = document.page(at: offset) else { continue }
+                boxes[offset + 1] = page.bounds(for: .cropBox)
+                var ids = Set<ObjectIdentifier>()
+                for annotation in page.annotations {
+                    let id = ObjectIdentifier(annotation)
+                    ids.insert(id)
+                    index[id] = (annotation.type ?? "", annotation.bounds)
+                }
+                annotations[offset + 1] = ids
+            }
+        }
+    }
 
     init(document: PDFDocument, url: URL) {
         self.document = document
         self.url = url
-        var boxes: [Int: CGRect] = [:]
-        for index in 0..<document.pageCount {
-            guard let page = document.page(at: index) else { continue }
-            boxes[index + 1] = page.bounds(for: .cropBox)
+        let baseline = Baseline(of: document)
+        self.originalAnnotations = baseline.annotations
+        self.originalIndex = baseline.index
+        self.originalBoxes = baseline.boxes
+    }
+
+    /// Take over a document that has replaced the one this session was editing.
+    ///
+    /// Nothing about the history is rewritten. Every step holds annotations --
+    /// which crossed over as the same objects, so the closures still hold the
+    /// right marks -- and pages, which are looked up through `pages` and so
+    /// need only the redirection recorded here. The baseline is replaced
+    /// because "unsaved work" now means the difference from the *new* file.
+    func adopt(_ newDocument: PDFDocument,
+               moves: [(old: PDFPage, new: PDFPage)],
+               baseline: Baseline) {
+        for move in moves { pages.rebind(move.old, to: move.new) }
+        document = newDocument
+        originalBoxes = baseline.boxes
+        originalAnnotations = baseline.annotations
+        originalIndex = baseline.index
+        selection = selection.map {
+            Selection(annotation: $0.annotation, page: pages.resolve($0.page))
         }
-        self.originalBoxes = boxes
+        selections = selections.map {
+            Selection(annotation: $0.annotation, page: pages.resolve($0.page))
+        }
+        markChanged()
     }
 
     /// The pages whose box has moved since editing began, for the save to
@@ -82,9 +224,10 @@ final class PDFEditSession: ObservableObject {
     func trim(_ page: PDFPage, to rect: CGRect, label: String) {
         let old = page.bounds(for: .cropBox)
         guard rect != old, rect.width > 1, rect.height > 1 else { return }
+        let pages = self.pages
         perform(label,
-                undo: { page.setBounds(old, for: .cropBox) },
-                redo: { page.setBounds(rect, for: .cropBox) })
+                undo: { pages.setBounds(old, for: .cropBox, on: page) },
+                redo: { pages.setBounds(rect, for: .cropBox, on: page) })
     }
 
     // MARK: - Recording
@@ -115,7 +258,7 @@ final class PDFEditSession: ObservableObject {
     ///
     /// For the one case where an edit is abandoned rather than undone: a text
     /// box you drew and then typed nothing into. Leaving it on the redo stack
-    /// would let ⇧⌘U resurrect an empty, invisible annotation.
+    /// would let ⇧⌘Z resurrect an empty, invisible annotation.
     func discardLastStep() {
         guard let step = undoStack.popLast() else { return }
         step.undo()
@@ -149,6 +292,7 @@ final class PDFEditSession: ObservableObject {
         undoLabel = undoStack.last?.label
         redoLabel = redoStack.last?.label
         hasUnsavedChanges = dirty
+        NotificationCenter.default.post(name: .pdfEditSessionDidChange, object: document)
     }
 
     /// Set by anything that touches the document, cleared by a save. Undoing
@@ -160,29 +304,50 @@ final class PDFEditSession: ObservableObject {
     // MARK: - The edits themselves
 
     func add(_ annotation: PDFAnnotation, to page: PDFPage, label: String) {
+        let pages = self.pages
         perform(label,
                 undo: { [weak self] in
                     annotation.shouldDisplay = false
-                    page.removeAnnotation(annotation)
+                    pages.remove(annotation, from: page)
                     if self?.selection?.annotation === annotation { self?.selection = nil }
                 },
                 redo: {
                     annotation.shouldDisplay = true
-                    page.addAnnotation(annotation)
+                    pages.add(annotation, to: page)
                 })
         selection = Selection(annotation: annotation, page: page)
+        selections = [Selection(annotation: annotation, page: page)]
     }
 
     func remove(_ annotation: PDFAnnotation, from page: PDFPage) {
-        if selection?.annotation === annotation { selection = nil }
-        perform("deleting that mark",
+        remove([Selection(annotation: annotation, page: page)])
+    }
+
+    /// One undo step for the lot. A sentence marked across four lines is four
+    /// annotations and one act, so taking it away has to be one act too --
+    /// otherwise deleting a highlight takes four presses of ⌘Z to put back.
+    func remove(_ entries: [Selection]) {
+        guard !entries.isEmpty else { return }
+        if let current = selection?.annotation,
+           entries.contains(where: { $0.annotation === current }) {
+            selection = nil
+        }
+        selections.removeAll { entry in
+            entries.contains { $0.annotation === entry.annotation }
+        }
+        let pages = self.pages
+        perform(entries.count > 1 ? "deleting those marks" : "deleting that mark",
                 undo: {
-                    annotation.shouldDisplay = true
-                    page.addAnnotation(annotation)
+                    for entry in entries {
+                        entry.annotation.shouldDisplay = true
+                        pages.add(entry.annotation, to: entry.page)
+                    }
                 },
                 redo: {
-                    annotation.shouldDisplay = false
-                    page.removeAnnotation(annotation)
+                    for entry in entries {
+                        entry.annotation.shouldDisplay = false
+                        pages.remove(entry.annotation, from: entry.page)
+                    }
                 })
     }
 
@@ -196,7 +361,7 @@ final class PDFEditSession: ObservableObject {
     }
 
     /// `mergeWithLast` folds the change into the step already on top of the
-    /// stack, so drawing a text box and typing into it is one ⌘U rather than
+    /// stack, so drawing a text box and typing into it is one ⌘Z rather than
     /// two -- from where you sit it was one action.
     func setContents(_ new: String, on annotation: PDFAnnotation, mergeWithLast: Bool = false) {
         let old = annotation.contents ?? ""
@@ -337,6 +502,13 @@ final class PDFEditSession: ObservableObject {
     }
 
     // MARK: - Saving
+
+    /// Marks the session dirty without an undo step, for a document that
+    /// arrived already carrying your replayed marks.
+    func markCarriedOver() {
+        dirty = true
+        markChanged()
+    }
 
     func markSaved() {
         dirty = false

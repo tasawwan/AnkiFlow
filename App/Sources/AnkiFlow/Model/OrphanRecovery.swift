@@ -62,7 +62,7 @@ enum OrphanRecovery {
         let pdfURL: URL
         let evidence: Evidence
 
-        var name: String { pdfURL.deletingPathExtension().lastPathComponent }
+        var name: String { pdfURL.lectureName }
 
         static func == (lhs: Candidate, rhs: Candidate) -> Bool { lhs.pdfURL == rhs.pdfURL }
         func hash(into hasher: inout Hasher) { hasher.combine(pdfURL) }
@@ -180,8 +180,8 @@ enum OrphanRecovery {
 
         // 3. The name. Weak on its own, which is why it is last and why the
         //    window shows it as words in common rather than as a verdict.
-        let shared = words(oldName.deletingPathExtension().lastPathComponent)
-            .intersection(words(pdfURL.deletingPathExtension().lastPathComponent))
+        let shared = words(oldName.lectureName)
+            .intersection(words(pdfURL.lectureName))
         if !shared.isEmpty { return .name(shared: shared.count) }
 
         return .none
@@ -219,5 +219,21 @@ enum OrphanRecovery {
             throw CocoaError(.fileWriteUnknown)
         }
         AtomicWrite.setHidden(true, at: target)
+
+        // The notes were written beside the questions and were orphaned by the
+        // same rename, so they come along. Best effort: failing to move a note
+        // is not a reason to leave the questions stranded, and the note is still
+        // sitting under its old name where it can be found by eye.
+        // The orphan's own PDF name, reconstructed from its question file, so
+        // the note is looked for under the name it was actually written with.
+        let strandedPDF = orphan.sidecarURL.deletingPathExtension()
+            .deletingPathExtension()
+            .appendingPathExtension("pdf")
+        let notesSource = AnkiIdentity.notesURL(for: strandedPDF)
+        let notesTarget = AnkiIdentity.notesURL(for: pdfURL)
+        if manager.fileExists(atPath: notesSource.path),
+           !manager.fileExists(atPath: notesTarget.path) {
+            try? manager.moveItem(at: notesSource, to: notesTarget)
+        }
     }
 }

@@ -90,13 +90,15 @@ struct PDFEditBar: View {
                 redoButton
                 separator
                 toolButton(.select)
-                toolButton(.highlight)
+                toolButton(.lasso)
+                highlightMenu
                 toolButton(.underline)
                 toolButton(.strikeOut)
             }
             Group {
                 separator
                 toolButton(.pen)
+                toolButton(.eraser)
                 shapeMenu
                 toolButton(.text)
                 separator
@@ -109,11 +111,7 @@ struct PDFEditBar: View {
 
         Spacer(minLength: 8)
 
-        Text(hint)
-            .font(.system(size: 11))
-            .foregroundStyle(palette.dim)
-            .lineLimit(1)
-            .truncationMode(.tail)
+        Spacer(minLength: 4)
 
         // No `keyboardShortcut(.escape)`: that registers a window key
         // equivalent, resolved before the focused view sees the key, so Esc in
@@ -136,9 +134,12 @@ struct PDFEditBar: View {
             .help("Stop editing — the slide pane goes back to normal (Esc)")
     }
 
-    private var hint: String {
-        if state.hasUnsavedPDFEdits { return "Unsaved marks — ⌘S writes them into the PDF" }
-        return state.editTool.help
+    private var thicknessLabel: String {
+        switch state.editTool {
+        case .pen:           return "PEN THICKNESS"
+        case .freeHighlight: return "HIGHLIGHTER THICKNESS"
+        default:             return "THICKNESS"
+        }
     }
 
     private var separator: some View {
@@ -161,7 +162,7 @@ struct PDFEditBar: View {
 
     private var undoButton: some View {
         button(symbol: "arrow.uturn.backward", selected: false,
-               help: state.undoLabel.map { "Undo \($0) — ⌘U" } ?? "Undo — ⌘U") {
+               help: state.undoLabel.map { "Undo \($0) — ⌘Z" } ?? "Undo — ⌘Z") {
             state.undo()
         }
         .disabled(!state.canUndo)
@@ -169,7 +170,7 @@ struct PDFEditBar: View {
 
     private var redoButton: some View {
         button(symbol: "arrow.uturn.forward", selected: false,
-               help: state.redoLabel.map { "Redo \($0) — ⇧⌘U" } ?? "Redo — ⇧⌘U") {
+               help: state.redoLabel.map { "Redo \($0) — ⇧⌘Z" } ?? "Redo — ⇧⌘Z") {
             state.redo()
         }
         .disabled(!state.canRedo)
@@ -193,6 +194,52 @@ struct PDFEditBar: View {
         }
         .buttonStyle(.plain)
         .help(help)
+    }
+
+    /// Highlight has two flavours. Clicking the button picks up whichever you
+    /// used last, so the common case is still one click; the chevron switches
+    /// between them. Free Highlight is there for the slides that have no text
+    /// layer to drag across -- a scanned page, or a figure -- where the text
+    /// highlight has nothing to catch on and quietly does nothing.
+    private var highlightMenu: some View {
+        let marks: [PDFEditing.Tool] = [.highlight, .freeHighlight]
+        let current = marks.contains(state.editTool) ? state.editTool : .highlight
+        let active = marks.contains(state.editTool)
+        return Menu {
+            ForEach(marks) { mark in
+                Button {
+                    state.applyTextMarkTool(mark)
+                } label: {
+                    if state.editTool == mark {
+                        Label(mark.label, systemImage: "checkmark")
+                    } else {
+                        Label(mark.label, systemImage: mark.symbol)
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: current.symbol)
+                .font(.system(size: 12.5))
+                .foregroundStyle(active ? palette.ink : palette.dim)
+        } primaryAction: {
+            // Through the same path as underline and strike through. This
+            // button set the tool directly, so highlighting a phrase you had
+            // selected was the one of the three that did not work at all -- it
+            // switched tools and left the selection unmarked.
+            state.applyTextMarkTool(current)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.borderless)
+        .frame(width: 40, height: 22)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(active ? palette.surface : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 5)
+                .stroke(active ? palette.line : Color.clear, lineWidth: 1)
+        )
+        .help("Highlight — across text, or a free box for slides with no text")
     }
 
     /// The four shapes behind one button, showing whichever you last used —
@@ -310,6 +357,14 @@ struct StylePicker: View {
     @EnvironmentObject var state: AppState
     @Environment(\.palette) private var palette
 
+    private var thicknessLabel: String {
+        switch state.editTool {
+        case .pen:           return "PEN THICKNESS"
+        case .freeHighlight: return "HIGHLIGHTER THICKNESS"
+        default:             return "THICKNESS"
+        }
+    }
+
     private var selectedKind: String? {
         guard let annotation = state.editSession?.selection?.annotation else { return nil }
         return PDFEditing.kind(of: annotation)
@@ -329,16 +384,21 @@ struct StylePicker: View {
 
             if !selectedTextBox {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("THICKNESS")
+                    // Named, because the slider means something different
+                    // depending on what is in your hand: with the pen or the
+                    // highlighter up it sets that implement alone and is
+                    // remembered there, and the plain THICKNESS is the shared
+                    // one they both drop back to.
+                    Text(thicknessLabel)
                         .font(AppFont.rowLabel)
                         .tracking(0.6)
                         .foregroundStyle(palette.dim)
                     HStack(spacing: 8) {
-                        Slider(value: Binding(get: { state.editLineWidth },
+                        Slider(value: Binding(get: { state.activeLineWidth },
                                               set: { state.setEditLineWidth($0) }),
                                in: 1...8, step: 1)
                             .frame(width: 130)
-                        Text("\(Int(state.editLineWidth))")
+                        Text("\(Int(state.activeLineWidth))")
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(palette.dim)
                             .frame(width: 14, alignment: .trailing)
@@ -403,7 +463,10 @@ struct StylePicker: View {
                 .font(AppFont.rowLabel)
                 .tracking(0.6)
                 .foregroundStyle(palette.dim)
-            HStack(spacing: 8) {
+            // Wrapped rather than one long row: ten inks do not fit across a
+            // popover, and a row that overflows loses the last few silently.
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 21), spacing: 8)],
+                      alignment: .leading, spacing: 8) {
                 if none {
                     Button { pick(nil) } label: {
                         Image(systemName: "circle.slash")

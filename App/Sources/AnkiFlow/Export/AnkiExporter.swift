@@ -14,6 +14,14 @@ struct LecturePlan {
     var questions: [Question]
     /// Where this lecture went last time, from its own sidecar.
     let previousDeckName: String?
+    /// Set when this lecture's cards need to end up in a different deck than
+    /// the one they are in. `deckName` is already where this export is sending
+    /// them; this is the move that has to happen to the cards already there.
+    let driftedTo: String?
+    /// Whether that move is a formality (the folders simply revealed ancestors
+    /// the last export could not see) or a decision (a rename, or a lecture
+    /// that moved). See `DeckPath`.
+    let driftIsAutomatic: Bool
     /// Questions deleted from this lecture since it was last exported.
     let retiredQIDs: [String]
 }
@@ -35,7 +43,7 @@ struct LecturePlan {
 @MainActor
 struct AnkiExporter {
     let libraryRoot: URL
-    let settings: LibrarySettings
+    let settings: AppSettings
     let templates: [Template]
 
     /// Returns the summary plus the lectures with their export records updated,
@@ -45,7 +53,7 @@ struct AnkiExporter {
         var updatedPlans: [LecturePlan] = []
 
         let renderer = PageRenderer(
-            cacheDirectory: LibraryPaths.cacheDirectory(inLibrary: libraryRoot),
+            cacheDirectory: AppPaths.cacheDirectory,
             settings: settings
         )
 
@@ -92,7 +100,7 @@ struct AnkiExporter {
                     if question.export != nil {
                         summary.retired.append((
                             qid: question.qid,
-                            lecture: plan.pdfURL.deletingPathExtension().lastPathComponent
+                            lecture: plan.pdfURL.lectureName
                         ))
                     }
                     continue
@@ -103,7 +111,7 @@ struct AnkiExporter {
                 // One question is usually one note. A `.separate` occlusion
                 // question makes one note per mask, each with its own GUID, so
                 // Anki schedules and merges them independently.
-                for (variant, mask) in question.noteVariants {
+                for (variant, groupMasks) in question.noteVariants {
                 let hash = question.contentHash(
                     template: template,
                     renderVersion: settings.renderVersion,
@@ -125,7 +133,8 @@ struct AnkiExporter {
                     modification = max(now, (previous?.mod ?? 0) + 1)
                     if previous == nil { summary.newNotes += 1 } else { summary.changedNotes += 1 }
                 }
-                question.setExportRecord(ExportRecord(contentHash: hash, mod: modification),
+                question.setExportRecord(ExportRecord(contentHash: hash, mod: modification,
+                                                     textHash: question.textFingerprint),
                                          variant: variant)
                 plan.questions[index] = question
                 // --------------------------------------------------------------
@@ -133,7 +142,7 @@ struct AnkiExporter {
                 // Render every cited page, reusing the cache.
                 // Composition lives in one place so the preview shows exactly
                 // what gets exported -- see CardComposition.
-                let composition = CardComposition.images(for: question, mask: mask)
+                let composition = CardComposition.images(for: question, masks: groupMasks)
                 var frontImages: [String] = []
                 var backImages: [String] = []
                 for spec in composition.front {
@@ -218,9 +227,20 @@ struct AnkiExporter {
                 }
             }
 
-            let lectureName = plan.pdfURL.deletingPathExtension().lastPathComponent
-            if let previous = plan.previousDeckName, previous != plan.deckName {
-                summary.moved.append((lecture: lectureName, from: previous, to: plan.deckName))
+            let lectureName = plan.pdfURL.lectureName
+            if let drifted = plan.driftedTo {
+                summary.moved.append(DeckMove(
+                    lecture: lectureName,
+                    url: plan.pdfURL,
+                    // Where the cards are now. For an automatic move that is
+                    // the old name and `deckName` is already the new one; for
+                    // an offered one they are the same, because the export
+                    // deliberately stayed put.
+                    from: plan.driftIsAutomatic ? plan.previousDeckName ?? plan.deckName
+                                                : plan.deckName,
+                    to: drifted,
+                    isAutomatic: plan.driftIsAutomatic
+                ))
             }
             for qid in plan.retiredQIDs {
                 summary.retired.append((qid: qid, lecture: lectureName))
@@ -261,7 +281,7 @@ struct AnkiExporter {
 
     private func renderText(question: Question, template: Template?) -> (front: String, back: String) {
         switch question.kind {
-        case .basic, .slide2slide:
+        case .basic:
             return (paragraphs(question.front), paragraphs(question.back))
         case .occlusion:
             // The image is the question; any text is an optional prompt above it.

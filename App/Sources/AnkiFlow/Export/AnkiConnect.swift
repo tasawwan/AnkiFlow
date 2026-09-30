@@ -132,8 +132,8 @@ enum AnkiConnect {
     /// Puts cards that belong to a deck into it. The counterpart of
     /// `deleteNotes`: importing a package can neither delete a card nor move
     /// one, and these two are the only way to do either without the browser.
-    static func moveCards(to deck: String) async throws -> Int {
-        let query = ExportSummary.moveSearch(to: deck)
+    static func moveCards(from oldDeck: String, to deck: String) async throws -> Int {
+        let query = ExportSummary.moveSearch(from: oldDeck, to: deck)
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -153,9 +153,204 @@ enum AnkiConnect {
         if let error = found.error, !error.isEmpty { throw Failure.refused(error) }
         let ids = found.result ?? []
         guard !ids.isEmpty else { return 0 }
+        lastQuery = query
+
+        // The notes have to be collected *before* the move: the query is
+        // "tagged as living there, not in the deck we want", and the moment
+        // changeDeck runs it matches nothing.
+        let notes = await findNotes(matching: query)
 
         _ = try await call("changeDeck", params: ["cards": ids, "deck": deck], timeout: 60)
+
+        // And carry the path tag with them. The tag is not part of a note's
+        // content hash, so the next export only rewrites the notes you actually
+        // edited -- every untouched note would keep claiming it lives in the old
+        // deck, and the *next* move would search under a tag that half the cards
+        // no longer have and quietly leave them behind.
+        let tag = oldDeck.replacingOccurrences(of: " ", with: "-")
+        let newTag = deck.replacingOccurrences(of: " ", with: "-")
+        if newTag != tag, !notes.isEmpty {
+            // Best-effort: a collection that refuses the rename still got its
+            // cards moved, which is the part you asked for.
+            _ = try? await call("replaceTags", params: [
+                "notes": notes, "tag_to_replace": tag, "replace_with_tag": newTag
+            ], timeout: 60)
+        }
         return ids.count
+    }
+
+    /// Removes a deck once nothing is left in it.
+    ///
+    /// Checked rather than assumed, and checked without our note-type scope on
+    /// purpose: the question is whether *anything* is in there, including cards
+    /// this app never made. A deck that still holds something is left alone.
+    static func deleteDeckIfEmpty(_ deck: String) async {
+        let remaining = await findCards(matching: "\"deck:\(deck)\"")
+        guard remaining.isEmpty else { return }
+        _ = try? await call("deleteDecks",
+                            params: ["decks": [deck], "cardsToo": true],
+                            timeout: 60)
+    }
+
+    // MARK: - Reading back
+
+    /// Every note this app has ever made, as Anki currently holds it.
+    static func findNotesScoped(query extra: String = "") async throws -> [Int64] {
+        let search = extra.isEmpty
+            ? AnkiIdentity.noteTypeScope
+            : "\(AnkiIdentity.noteTypeScope) \(extra)"
+        return await find("findNotes", matching: search)
+    }
+
+    static func guids(of ids: [Int64]) async throws -> [String] {
+        try await notesInfo(ids).map(\.guid)
+    }
+
+    /// Notes edited in the last day. Best-effort: if the collection refuses the
+    /// search -- an older Anki that doesn't know `edited:` -- this returns
+    /// nothing rather than throwing, and the poll simply finds no edits until
+    /// the sheet is opened.
+    static func findNotesEditedRecently(days: Int = 1) async -> [Int64] {
+        await find("findNotes", matching: "\(AnkiIdentity.noteTypeScope) edited:\(days)")
+    }
+
+    /// Fields and tags for the given notes.
+    ///
+    /// Asked for in batches: `notesInfo` returns every field of every note,
+    /// including the image stacks, and a whole collection in one response is
+    /// megabytes of HTML for the sake of two short text fields.
+    static func notesInfo(_ ids: [Int64]) async throws -> [AnkiNote] {
+        var out: [AnkiNote] = []
+        for batch in stride(from: 0, to: ids.count, by: 200).map({
+            Array(ids[$0..<min($0 + 200, ids.count)])
+        }) {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 60
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "action": "notesInfo", "version": 6, "params": ["notes": batch]
+            ])
+
+            let data: Data
+            do {
+                (data, _) = try await URLSession.shared.data(for: request)
+            } catch {
+                throw Failure.unreachable
+            }
+            let decoded = try JSONDecoder().decode(NotesInfo.self, from: data)
+            if let error = decoded.error, !error.isEmpty { throw Failure.refused(error) }
+
+            for note in decoded.result ?? [] {
+                let guid = note.fields["QID"]?.value ?? ""
+                guard !guid.isEmpty else { continue }
+                out.append(AnkiNote(
+                    noteID: note.noteId,
+                    guid: guid,
+                    front: AnkiSync.plainText(fromHTML: note.fields["Front"]?.value ?? ""),
+                    back: AnkiSync.plainText(fromHTML: note.fields["Back"]?.value ?? ""),
+                    // The path tag is this app's bookkeeping. Letting it back in
+                    // would turn the deck path into a tag you never chose.
+                    tags: note.tags.filter { !$0.hasPrefix(AnkiIdentity.tagPrefix) },
+                    media: Self.imageNames(in: (note.fields["FrontMedia"]?.value ?? "")
+                                           + (note.fields["BackMedia"]?.value ?? ""))
+                ))
+            }
+        }
+        return out
+    }
+
+    private static func imageNames(in html: String) -> [String] {
+        let pattern = "src=\"([^\"]+)\""
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let text = html as NSString
+        return regex.matches(in: html, range: NSRange(location: 0, length: text.length))
+            .compactMap { match in
+                guard match.numberOfRanges > 1 else { return nil }
+                return text.substring(with: match.range(at: 1))
+            }
+    }
+
+    /// Removes slide images in Anki's media folder that nothing points at.
+    ///
+    /// Every image AnkiFlow makes is named from the PDF's hash, so annotating a
+    /// lecture and re-exporting gives its slides new filenames and strands the
+    /// old ones. Nothing in Anki removes them, and for a lecture you annotate
+    /// every week that is most of what the collection weighs.
+    ///
+    /// Scoped by the `af_` prefix and checked against what the notes actually
+    /// reference, so it can only ever reach files this app wrote and is not
+    /// using. Anki's own Check Media is the blunt version of this; it also
+    /// catches everything else in your collection, which is why this one is
+    /// narrow enough to run on its own.
+    static func deleteUnusedMedia() async -> Int {
+        guard let ours = try? await mediaFileNames(matching: "af_*"), !ours.isEmpty else { return 0 }
+        guard let ids = try? await findNotesScoped() else { return 0 }
+        guard let notes = try? await notesInfo(ids) else { return 0 }
+
+        let referenced = Set(notes.flatMap(\.media))
+        let orphans = ours.filter { !referenced.contains($0) }
+        guard !orphans.isEmpty else { return 0 }
+
+        var removed = 0
+        for name in orphans {
+            let result = try? await call("deleteMediaFile",
+                                         params: ["filename": name], timeout: 30)
+            _ = result
+            removed += 1
+        }
+        return removed
+    }
+
+    private static func mediaFileNames(matching pattern: String) async throws -> [String] {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "action": "getMediaFilesNames", "version": 6, "params": ["pattern": pattern]
+        ])
+        guard let (data, _) = try? await URLSession.shared.data(for: request) else {
+            throw Failure.unreachable
+        }
+        struct Names: Decodable { let result: [String]?; let error: String? }
+        let decoded = try JSONDecoder().decode(Names.self, from: data)
+        if let error = decoded.error, !error.isEmpty { throw Failure.refused(error) }
+        return decoded.result ?? []
+    }
+
+    private struct NotesInfo: Decodable {
+        struct Note: Decodable {
+            struct Field: Decodable { let value: String }
+            let noteId: Int64
+            let tags: [String]
+            let fields: [String: Field]
+        }
+        let result: [Note]?
+        let error: String?
+    }
+
+    private static func findCards(matching query: String) async -> [Int64] {
+        await find("findCards", matching: query)
+    }
+
+    private static func findNotes(matching query: String) async -> [Int64] {
+        await find("findNotes", matching: query)
+    }
+
+    private static func find(_ action: String, matching query: String) async -> [Int64] {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "action": action, "version": 6, "params": ["query": query]
+        ])
+        guard let response = try? await URLSession.shared.data(for: request),
+              let found = try? JSONDecoder().decode(NoteIDs.self, from: response.0) else {
+            return []
+        }
+        return found.result ?? []
     }
 
     private struct NoteIDs: Decodable {

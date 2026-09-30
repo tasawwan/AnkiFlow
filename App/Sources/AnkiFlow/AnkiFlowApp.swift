@@ -101,7 +101,11 @@ struct AnkiFlowApp: App {
         // There is no separate "Update from Source" item: rebuilding is only
         // ever worth doing when there is something new to rebuild, so it is
         // offered by the alert that just told you so.
-        CommandGroup(replacing: .appInfo) {
+        // Grouped only to stay under the ten-child limit a Commands builder
+        // imposes, the same way the View menu's own contents are. No effect on
+        // where anything appears.
+        Group {
+            CommandGroup(replacing: .appInfo) {
             Button("About AnkiFlow") { openWindow(WindowID.about) }
 
             Divider()
@@ -115,10 +119,10 @@ struct AnkiFlowApp: App {
         // Services is a system courtesy for apps that hand text to other apps.
         // This one hands you .apkg files; the submenu was noise in the menu that
         // carries the app's own name.
-        CommandGroup(replacing: .systemServices) { }
+            CommandGroup(replacing: .systemServices) { }
 
         // File
-        CommandGroup(replacing: .newItem) {
+            CommandGroup(replacing: .newItem) {
             // New Question is in the Question menu with the rest of the fast
             // path. Two menu entries for one key taught nobody anything.
             Button("Open Library…") { openLibraryPanel(state: state) }
@@ -134,48 +138,87 @@ struct AnkiFlowApp: App {
 
             Divider()
 
-            // ⌘D for Deck. ⌘E belongs to Extend, which is pressed hundreds of
-            // times a session against Export's once.
+            Button("Sort Questions by Slide") { state.sortQuestionsBySlides() }
+                .disabled(state.document == nil)
+
+            Button("Re-file Clinical Topics") { state.reclassifyClinicalTopics() }
+                .disabled(state.library == nil)
+
+            Divider()
+
             Button("Export Deck…") {
                 state.document?.saveNow()
                 state.showExportSheet = true
             }
+            // ⌘D for Deck. ⌘E belongs to Extend, which is pressed hundreds of
+            // times a session against Export's once.
             .keyboardShortcut("d", modifiers: .command)
+            .disabled(state.library == nil)
+
+            // The other direction. Deliberately not on the export sheet: an
+            // export is something you do to Anki, and this is something Anki
+            // did to you -- reading them as one command would make every export
+            // a two-way operation you did not ask for.
+            Button(syncMenuTitle(state)) {
+                state.document?.saveNow()
+                state.showSyncSheet = true
+            }
+            .keyboardShortcut("d", modifiers: [.command, .shift])
             .disabled(state.library == nil)
         }
 
         // There is no Save command: the app autosaves and has no unsaved state,
         // so the key is left unbound rather than given a job to justify it.
-        CommandGroup(replacing: .saveItem) { }
+            CommandGroup(replacing: .saveItem) { }
 
-        // ⌘U. SwiftUI's own Undo item only reaches a focused text field's undo
-        // manager, so every structural change -- attaching slides, cropping,
-        // masks, deleting a question -- had no undo at all. This one asks the
-        // text field first and falls back to the app's own stack, which is what
-        // ⌘U is expected to mean in both places.
-        // One Undo, two stacks. While the markup bar is up ⌘U takes back the
+        // One Undo, two stacks. While the markup bar is up ⌘Z takes back the
         // last mark; the rest of the time it takes back the last thing you did
         // to your questions. Two separate shortcuts would mean remembering
         // which one you were in.
-        CommandGroup(replacing: .undoRedo) {
-            Button(state.isEditingPDF ? "Underline Text" : (state.undoLabel.map { "Undo \($0)" } ?? "Undo")) {
-                if state.isEditingPDF { state.toggleEditUnderline() } else { state.undo() }
+        // One Undo, on the key every Mac app uses. It aims at whichever stack is
+        // in play: the markup bar's while that is up, the note's own typing
+        // history while the caret is in a note -- the text view claims ⌘Z for
+        // itself there -- and otherwise the questions.
+        //
+        // ⌘U is not undo. It was, briefly, as a workaround; it is the underline
+        // key on this platform and it is spent that way now, on PDF markup here
+        // and on note text inside the notes editor.
+            CommandGroup(replacing: .undoRedo) {
+            Button(state.undoLabel.map { "Undo \($0)" } ?? "Undo") {
+                if state.isEditingPDF { state.undoEdit() } else { state.undo() }
             }
-                .keyboardShortcut("u", modifiers: .command)
-                .disabled(!state.isEditingPDF && !state.canUndo)
+            .keyboardShortcut("z", modifiers: .command)
+            .disabled(!state.canUndo)
+
             Button(state.redoLabel.map { "Redo \($0)" } ?? "Redo") {
                 if state.isEditingPDF { state.redoEdit() } else { state.redo() }
             }
-                .keyboardShortcut("z", modifiers: [.command, .shift])
-                .disabled(!state.canRedo)
-            Button("Undo") { if state.isEditingPDF { state.undoEdit() } else { state.undo() } }
-                .keyboardShortcut("z", modifiers: .command)
-                .disabled(!state.canUndo)
+            .keyboardShortcut("z", modifiers: [.command, .shift])
+            .disabled(!state.canRedo)
+
+            Divider()
+
+            Button("Underline") { state.toggleEditUnderline() }
+                .keyboardShortcut("u", modifiers: .command)
+                .disabled(!state.isEditingPDF)
         }
 
         // Find lives in Edit, where everyone already looks for it. It searches
         // the PDF rather than your questions: finding the slide that mentions a
         // term is what you do while writing a question about it.
+        }
+
+        // Not `pasteAsPlainText:`, which was the first attempt and did nothing
+        // here: SwiftUI's multi-line TextField is not an AppKit field editor, so
+        // that responder action found nobody to answer it. And dropping the
+        // styling was never the point -- text copied out of a PDF arrives
+        // wrapped at the slide's line width, and it is those line breaks you
+        // want gone. See PasteCleaner.
+        CommandGroup(after: .pasteboard) {
+            Button("Paste Without Formatting") { PasteCleaner.pasteReflowed() }
+                .keyboardShortcut("v", modifiers: [.command, .shift])
+        }
+
         CommandGroup(after: .textEditing) {
             Divider()
             // Two axes, one letter. ⌘ is slides, ⌥ is questions; adding ⇧ or ⌘
@@ -194,10 +237,6 @@ struct AnkiFlowApp: App {
 
             Divider()
 
-            Button("Find Questions in Lecture…") { state.openSearch(.lectureQuestions) }
-                .keyboardShortcut("f", modifiers: .option)
-                .disabled(state.document == nil)
-
             Button("Find Questions in Library…") { state.openSearch(.libraryQuestions) }
                 .keyboardShortcut("f", modifiers: [.command, .option])
                 .disabled(state.library == nil)
@@ -205,21 +244,71 @@ struct AnkiFlowApp: App {
 
         // View
         CommandGroup(after: .toolbar) {
-            Button("Toggle Sidebar") { state.showSidebar.toggle() }
-                .keyboardShortcut("1", modifiers: .command)
-            Button("Toggle Slide Gallery") { state.showThumbnails.toggle() }
-                .keyboardShortcut("2", modifiers: .command)
-            Button(state.showFlaggedPagesOnly ? "Show All Pages" : "Show Flagged Pages Only") {
-                state.toggleFlaggedPagesOnly()
+            // Grouped only to stay under the ten-child limit a ViewBuilder
+            // imposes. No effect on the menu.
+            Group {
+                Button("Toggle Sidebar") { state.showSidebar.toggle() }
+                    .keyboardShortcut("1", modifiers: .command)
+                Button("Toggle Slide Gallery") { state.showThumbnails.toggle() }
+                    .keyboardShortcut("2", modifiers: .command)
+                Button(state.showFlaggedPagesOnly ? "Show All Pages" : "Show Flagged Pages Only") {
+                    state.toggleFlaggedPagesOnly()
+                }
+                .keyboardShortcut("3", modifiers: .command)
+                .disabled(state.document == nil || state.flaggedPages.isEmpty)
+                Button(state.showNotes ? "Hide Notes" : "Show Notes") { state.showNotes.toggle() }
+                    .keyboardShortcut("4", modifiers: .command)
+                Button(state.showUncoveredPagesOnly
+                       ? "Show All Pages" : "Show Slides With No Question") {
+                    state.showUncoveredPagesOnly.toggle()
+                }
+                .keyboardShortcut("5", modifiers: .command)
+                .disabled(state.document == nil)
             }
-            .keyboardShortcut("3", modifiers: .command)
-            .disabled(state.document == nil || state.flaggedPages.isEmpty)
+
             Divider()
-            Button("Next Page") { state.nextPage() }
-                .keyboardShortcut(.downArrow, modifiers: .command)
-            Button("Previous Page") { state.previousPage() }
-                .keyboardShortcut(.upArrow, modifiers: .command)
+
+            Group {
+                Button("Next Page") { state.nextPage() }
+                    .keyboardShortcut(.downArrow, modifiers: .command)
+                Button("Previous Page") { state.previousPage() }
+                    .keyboardShortcut(.upArrow, modifiers: .command)
+                // A submenu rather than a shortcut each: the list is yours to
+                // grow, so there is no fixed set of keys to hand out. A tick
+                // means the slide already carries it, and choosing it again
+                // takes it off.
+                Menu("Tag This Slide") {
+                    ForEach(state.pageTags) { tag in
+                        let carried = state.tagsOnCurrentPage.contains(tag.label)
+                        Button(carried ? "\(tag.label) ✓" : tag.label) {
+                            state.togglePageTag(tag.label)
+                        }
+                    }
+                }
+                .disabled(state.document == nil || state.pageTags.isEmpty)
+            }
+
             Divider()
+
+            // Text size for the notes. Bound to "=" as well as "+", because ⌘+
+            // on most keyboards is really ⌘⇧= and the unshifted key is the one
+            // that actually arrives; the menu still draws it as ⌘+.
+            // Bound to "=" rather than "+", which is the key actually pressed:
+            // ⌘+ is ⌘⇧= on most layouts, so a shortcut declared as "+" only
+            // fires with shift held. The menu draws ⌘= and everyone reads it as
+            // "bigger" anyway. A second, hidden item for the other spelling was
+            // worse than useless -- a hidden menu item registers no shortcut.
+            Group {
+                Button("Bigger Text") { state.changeTextSize(.bigger) }
+                    .keyboardShortcut("=", modifiers: .command)
+                Button("Smaller Text") { state.changeTextSize(.smaller) }
+                    .keyboardShortcut("-", modifiers: .command)
+                Button("Actual Size") { state.changeTextSize(.reset) }
+                    .keyboardShortcut("0", modifiers: .command)
+            }
+
+            Divider()
+
             Button("Cycle Card Type") { state.cyclePanelType() }
                 .keyboardShortcut("y", modifiers: .command)
 
@@ -232,8 +321,6 @@ struct AnkiFlowApp: App {
                 .disabled(state.library == nil)
         }
 
-        // Question -- every gesture on the fast path, with its key printed
-        // beside it. This menu is how you relearn the bindings after a month off.
         CommandMenu("Question") {
             Button("New Question") { state.newQuestion() }
                 .keyboardShortcut("n", modifiers: .command)
@@ -252,7 +339,7 @@ struct AnkiFlowApp: App {
             Button("Re-anchor Here") { state.setAnchorToCurrentPage() }
                 .keyboardShortcut("r", modifiers: .command)
 
-            // No shortcut: ⌘U is Undo now, and undoing a crop is what that key
+            // No shortcut: ⌘Z is Undo, and undoing a crop is what that key
             // is for. This stays in the menu for removing an older crop you have
             // since typed past.
             Button("Uncrop This Page") { state.clearCrop(page: state.currentPage) }
@@ -403,11 +490,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    /// Markup is the one kind of edit in this app that is not written as you go.
+    /// Everything else autosaves; marks on a slide wait for the Save button
+    /// deliberately, so that trying things out on a lecture PDF is safe. The
+    /// cost of that choice is that quitting is the moment it can all be thrown
+    /// away silently, which is what this stops.
+    ///
+    /// Asked here rather than by watching the window close: Quit does not close
+    /// windows first, it terminates, so a check hung off the window would never
+    /// run.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let state, state.hasUnsavedPDFEdits else { return .terminateNow }
+
+        let name = state.document?.pdfURL.finderName ?? "this lecture"
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Save your markup into \(name)?"
+        alert.informativeText = "You have marks on the slides that have not been written into the PDF yet. Quitting without saving throws them away."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Discard")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            // Only leave if the write actually worked. A failed save that quit
+            // anyway would lose the marks and claim it had saved them.
+            return state.savePDFEdits() ? .terminateNow : .terminateCancel
+        case .alertThirdButtonReturn:
+            state.stopEditingPDF(discardingChanges: true)
+            return .terminateNow
+        default:
+            return .terminateCancel
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        state?.discardEmptyFocusedQuestion()
         state?.document?.saveNow()
+        // Notes autosave on a debounce, so quitting mid-sentence would drop the
+        // last second or so of typing without this.
+        state?.notes?.saveNow()
     }
 
     func applicationDidResignActive(_ notification: Notification) {
+        state?.discardEmptyFocusedQuestion()
         state?.document?.saveNow()
+        state?.notes?.saveNow()
     }
+}
+
+/// "Changes in Anki… (3)" when the background poll has found things waiting on
+/// a decision. A count in a menu is the quietest way to say so: nothing
+/// interrupts you, and the number is there when you go looking.
+@MainActor
+private func syncMenuTitle(_ state: AppState) -> String {
+    guard let pending = state.pendingSync else { return "Changes in Anki…" }
+    let waiting = pending.edits.count + pending.deletions.count
+    return waiting == 0 ? "Changes in Anki…" : "Changes in Anki… (\(waiting))"
 }

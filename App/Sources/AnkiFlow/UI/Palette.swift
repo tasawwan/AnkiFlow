@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The app's two skins: **Editorial** in light, **Studio** in dark.
 ///
@@ -99,6 +100,14 @@ enum AppFont {
     /// Question text is set in a serif, because writing questions is the job.
     static func question(_ size: CGFloat) -> Font {
         .system(size: size, weight: .regular, design: .serif)
+    }
+
+    /// The same serif as an NSFont, for the text views that draw themselves.
+    static func questionNS(_ size: CGFloat) -> NSFont {
+        let descriptor = NSFont.systemFont(ofSize: size).fontDescriptor
+            .withDesign(.serif) ?? NSFont.systemFont(ofSize: size).fontDescriptor
+        return NSFont(descriptor: descriptor, size: size)
+            ?? NSFont.systemFont(ofSize: size)
     }
 
     /// Small-caps row labels: "ANSWER SLIDES".

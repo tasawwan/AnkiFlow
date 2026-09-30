@@ -177,7 +177,6 @@ struct SearchSheet: View {
     private var placeholder: String {
         switch state.searchScope {
         case .librarySlides:    return "Search every lecture's slides — Return to run"
-        case .lectureQuestions: return "Search this lecture's questions"
         case .libraryQuestions: return "Search every question"
         }
     }

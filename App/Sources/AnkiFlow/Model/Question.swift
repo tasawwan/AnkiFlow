@@ -4,7 +4,6 @@ import CryptoKit
 
 enum QuestionKind: String, Codable {
     case basic
-    case slide2slide
     case template
     case occlusion
     /// Text with `{{c1::…}}` deletions. Unlike every other kind this makes one
@@ -23,10 +22,29 @@ enum QuestionKind: String, Codable {
 struct Mask: Codable, Equatable, Identifiable {
     var id: String
     var rect: CropRect
+    /// Which card hides this region. Regions sharing a group are hidden and
+    /// revealed together, the way cloze blanks sharing an ordinal are.
+    ///
+    /// Numbers are handed out and never reused or renumbered. A group number is
+    /// part of how a card is identified across exports, and closing the gaps
+    /// after a delete -- which the cloze list does, because Anki cares about
+    /// contiguous ordinals and nothing here does -- would silently re-point
+    /// every card after the gap at different regions.
+    var group: Int
 
-    init(rect: CropRect) {
+    init(rect: CropRect, group: Int = 1) {
         self.id = ULID.generate()
         self.rect = rect
+        self.group = group
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        rect = try c.decode(CropRect.self, forKey: .rect)
+        // Absent in every file written before grouping existed. `Question`
+        // fixes those up from `occlusionMode`, which is what used to carry this.
+        group = try c.decodeIfPresent(Int.self, forKey: .group) ?? 0
     }
 }
 
@@ -64,6 +82,20 @@ enum OcclusionMode: String, Codable, CaseIterable, Identifiable {
 struct ExportRecord: Codable, Equatable {
     var contentHash: String
     var mod: Int
+    /// What the written text looked like when this note last went to Anki --
+    /// the common ancestor, which is the only thing that makes a three-way
+    /// merge possible.
+    ///
+    /// Without it, "the text here differs from the text in Anki" cannot tell
+    /// you *which side moved*, and a sync can only ever guess. With it: their
+    /// side differs from the base means Anki changed, my side differs from the
+    /// base means the app changed, both means a genuine conflict worth asking
+    /// about. One string per record, and it is a hash rather than the text
+    /// itself so a sidecar doesn't carry a second copy of every card.
+    ///
+    /// Optional because a record written before a sync has ever run has no
+    /// ancestor to name; those are treated as "no opinion", not as a conflict.
+    var textHash: String?
 }
 
 /// A crop, in normalized page coordinates: fractions of the page's crop box,
@@ -139,13 +171,13 @@ struct Question: Codable, Identifiable, Equatable {
     var front: String
     var back: String
     var blanks: [String: String]
-    /// 1-based PDF page numbers. Front-side slides (Slide2Slide only).
+    /// 1-based PDF page numbers. The slides shown with the question.
     var questionPages: [Int]
     /// 1-based PDF page numbers. The answer stack.
     var answerPages: [Int]
     /// Per-page crops, keyed by page number. A page with no entry is shown whole.
     ///
-    /// Two dictionaries rather than one because Slide2Slide can legitimately
+    /// Two dictionaries rather than one because a question can legitimately
     /// cite the same page on both sides, and a single map keyed by page number
     /// could not tell the front's crop from the back's.
     var questionCrops: [Int: CropRect]
@@ -161,6 +193,28 @@ struct Question: Codable, Identifiable, Equatable {
     /// produces, keyed by mask id. `export` covers every other question, which
     /// produces exactly one note.
     var childExports: [String: ExportRecord]
+
+    /// True when this question was decoded from a card type that no longer
+    /// exists and was read as Basic instead.
+    ///
+    /// Not persisted and not in `CodingKeys` -- it lives just long enough for
+    /// `LectureDocument` to notice and write the file back in the current shape.
+    /// Without it the fallback is silent and permanent: every open would
+    /// reinterpret the same stale value, and a file you had been using for
+    /// months would still say `slide2slide` in it.
+    var wasMigrated = false
+
+    /// Which template's tab this question is sitting in, when the answer cannot
+    /// be worked out from the text alone.
+    ///
+    /// Not persisted, and deliberately so. A template is a lens: a question
+    /// built through one is an ordinary Basic card, and which tab it belongs in
+    /// is re-derived from its text every time a library is opened. The one case
+    /// text cannot answer is a question you have just made and not yet typed
+    /// into -- empty text matches nothing -- so this holds the tab you made it
+    /// on until there are words to recognise. It lives exactly as long as the
+    /// session does, which is exactly as long as it is needed.
+    var viewTemplateId: String?
 
     var id: String { qid }
 
@@ -196,7 +250,17 @@ struct Question: Codable, Identifiable, Equatable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         qid = try c.decode(String.self, forKey: .qid)
-        kind = try c.decodeIfPresent(QuestionKind.self, forKey: .kind) ?? .basic
+        // Slide2Slide was folded into Basic once every card gained both slide
+        // rows -- the two had become the same thing. Old question files still
+        // say "slide2slide", and decoding one has to keep working: an unknown
+        // kind would throw, and throwing here loses the whole lecture's
+        // questions rather than one field.
+        let storedKind = (try? c.decodeIfPresent(QuestionKind.self, forKey: .kind)).flatMap { $0 }
+        kind = storedKind ?? .basic
+        // A kind that failed to decode was one this app used to have. Flagged so
+        // the document rewrites the file, rather than falling back to Basic
+        // again on every open for the rest of the file's life.
+        wasMigrated = storedKind == nil && c.contains(.kind)
         templateId = try c.decodeIfPresent(String.self, forKey: .templateId)
         front = try c.decodeIfPresent(String.self, forKey: .front) ?? ""
         back = try c.decodeIfPresent(String.self, forKey: .back) ?? ""
@@ -213,6 +277,15 @@ struct Question: Codable, Identifiable, Equatable {
         export = try c.decodeIfPresent(ExportRecord.self, forKey: .export)
         masks = try c.decodeIfPresent([Mask].self, forKey: .masks) ?? []
         occlusionMode = try c.decodeIfPresent(OcclusionMode.self, forKey: .occlusionMode) ?? .separate
+        // A file from before groups existed says only "all at once" or "one at a
+        // time". Both are groupings: one group holding everything, or a group
+        // each. Written out this way the two old modes keep behaving exactly as
+        // they did, and are now just two of the shapes you can make.
+        if masks.contains(where: { $0.group == 0 }) {
+            for index in masks.indices where masks[index].group == 0 {
+                masks[index].group = occlusionMode == .allAtOnce ? 1 : index + 1
+            }
+        }
         childExports = try c.decodeIfPresent([String: ExportRecord].self, forKey: .childExports) ?? [:]
     }
 
@@ -364,12 +437,49 @@ struct Question: Codable, Identifiable, Equatable {
     /// The notes this question produces. Everything except a `.separate`
     /// occlusion makes exactly one; that makes one per mask, each with its own
     /// GUID so Anki merges and schedules them independently.
-    var noteVariants: [(variant: String, mask: Mask?)] {
-        guard kind == .occlusion, occlusionMode == .separate, !masks.isEmpty else {
-            return [(variant: "", mask: nil)]
-        }
-        return masks.map { (variant: $0.id, mask: $0) }
+    /// The regions on each card, in group order.
+    var maskGroups: [[Mask]] {
+        guard kind == .occlusion, !masks.isEmpty else { return [] }
+        var order: [Int] = []
+        for mask in masks where !order.contains(mask.group) { order.append(mask.group) }
+        return order.map { group in masks.filter { $0.group == group } }
     }
+
+    /// The notes this question produces. Everything except an occlusion makes
+    /// exactly one; an occlusion makes one per group, each with its own GUID so
+    /// Anki merges and schedules them independently.
+    ///
+    /// A group's variant is its **first region's id**, not its group number.
+    /// That keeps every card ever exported one-region-at-a-time exactly where it
+    /// is -- its group holds only that region, so the variant is the same string
+    /// it always was -- and it means adding a second region to a card keeps that
+    /// card's review history rather than retiring it and starting again.
+    var noteVariants: [(variant: String, masks: [Mask])] {
+        guard kind == .occlusion, !masks.isEmpty else { return [(variant: "", masks: [])] }
+        let groups = maskGroups
+        // One group covering everything is the old "all at once", and that card
+        // was exported with an empty variant. `occlusionMode` is what tells the
+        // two single-group cases apart -- everything on one card, versus a
+        // question that only ever had one region -- and it is kept in step for
+        // exactly this, so both keep the GUID they already have.
+        if groups.count == 1, occlusionMode == .allAtOnce {
+            return [(variant: "", masks: groups[0])]
+        }
+        return groups.map { (variant: $0.first?.id ?? "", masks: $0) }
+    }
+
+    /// True when the regions are spread over more than one card.
+    var isGrouped: Bool { maskGroups.count > 1 }
+
+    /// One group holding everything -- the old "all at once".
+    var isOneCard: Bool { maskGroups.count == 1 && masks.count > 1 }
+
+    /// A region per card -- the old "one at a time".
+    var isOnePerCard: Bool { !masks.isEmpty && maskGroups.count == masks.count }
+
+    /// The next group number to hand out. One past the highest in use, so a
+    /// number is never reused by a different set of regions.
+    var nextMaskGroup: Int { (masks.map(\.group).max() ?? 0) + 1 }
 
     /// The Anki GUID for one produced note. Derived from the question's ULID and
     /// the mask's, so it is the same string on every future export -- which is
@@ -396,6 +506,18 @@ struct Question: Codable, Identifiable, Equatable {
         return (questionPages + answerPages).filter { seen.insert($0).inserted }
     }
 
+    /// No words on it yet.
+    ///
+    /// Distinct from `isEmpty`, which also counts slides. A card you have
+    /// attached a slide to but not typed into is not empty -- it is worth
+    /// keeping -- but there is still no text for a template to recognise, and
+    /// asking `isEmpty` that question put a half-made card out of its own tab
+    /// the moment you pressed ⌘T.
+    var hasNoText: Bool {
+        front.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && back.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// True when there is nothing worth exporting yet.
     var isEmpty: Bool {
         front.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -409,7 +531,7 @@ struct Question: Codable, Identifiable, Equatable {
     func summary(template: Template?) -> String {
         let text: String
         switch kind {
-        case .basic, .slide2slide, .occlusion:
+        case .basic, .occlusion:
             text = front
         case .cloze:
             // The markup would dominate a one-line label, so the list shows the
@@ -478,6 +600,13 @@ struct Question: Codable, Identifiable, Equatable {
         if kind == .occlusion, occlusionMode == .allAtOnce, !masks.isEmpty {
             parts.append("allAtOnce-r2")
         }
+        // Only when the grouping is something the two old modes could not
+        // express. A region per card and everything on one card both hash
+        // exactly as they always did, so nothing written before groups existed
+        // re-exports for having been read by a version that understands them.
+        if kind == .occlusion, isGrouped, !isOnePerCard {
+            parts.append("groups:" + masks.map { "\($0.id):\($0.group)" }.joined(separator: ";"))
+        }
         for key in blanks.keys.sorted() {
             parts.append("\(key)=\(blanks[key] ?? "")")
         }
@@ -491,6 +620,29 @@ struct Question: Codable, Identifiable, Equatable {
 }
 
 extension Question {
+    /// The written text alone -- what a person types, and what a person can
+    /// also type into Anki. Deliberately excludes everything generated from the
+    /// PDF: slides, crops, masks and media filenames have no counterpart in the
+    /// Anki editor, so including them would report a conflict every time a
+    /// lecture was re-annotated.
+    ///
+    /// Whitespace is trimmed on both sides of the comparison because Anki's
+    /// editor adds and removes it freely, and a card is not "edited in Anki"
+    /// for having gained a trailing newline.
+    static func textFingerprint(front: String, back: String, tags: [String]) -> String {
+        let parts = [
+            front.trimmingCharacters(in: .whitespacesAndNewlines),
+            back.trimmingCharacters(in: .whitespacesAndNewlines),
+            tags.map { $0.lowercased() }.sorted().joined(separator: ",")
+        ]
+        let digest = SHA256.hash(data: Data(parts.joined(separator: "\u{1F}").utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    var textFingerprint: String {
+        Question.textFingerprint(front: front, back: back, tags: tags)
+    }
+
     static func masksFingerprint(_ masks: [Mask]) -> String {
         masks.map { "\($0.id):\($0.rect.fingerprint)" }.joined(separator: ";")
     }

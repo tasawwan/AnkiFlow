@@ -1,6 +1,7 @@
 import Foundation
 import PDFKit
 import CoreGraphics
+import AppKit
 import CryptoKit
 import ImageIO
 import UniformTypeIdentifiers
@@ -11,9 +12,10 @@ import UniformTypeIdentifiers
 /// same name every time. That means media deduplicates automatically when six
 /// questions cite the same slide, re-exports never pile up orphan copies in the
 /// collection, and a name collision with another deck is effectively impossible.
+@MainActor
 struct PageRenderer {
     let cacheDirectory: URL
-    let settings: LibrarySettings
+    let settings: AppSettings
 
     /// WebP encoding is not available on every macOS version, so ask rather than assume.
     static let webPSupported: Bool = {
@@ -80,21 +82,26 @@ struct PageRenderer {
         var hidden: [CropRect] = []
         /// Filled opaque in the accent colour: hidden, and this is the region
         /// the card is asking about.
-        var target: CropRect?
+        var targets: [CropRect] = []
         /// Stroked, not filled: visible, and these are the regions the card
         /// asked about. One for a card testing a single region; all of them on
         /// the back of an all-at-once card, where the answer is "here is what
         /// was covered" and the boxes are what say where.
         var outlined: [CropRect] = []
 
-        var isEmpty: Bool { hidden.isEmpty && target == nil && outlined.isEmpty }
+        var isEmpty: Bool { hidden.isEmpty && targets.isEmpty && outlined.isEmpty }
 
         /// Every distinct combination of masks is a distinct image and must be a
         /// distinct filename -- six cards off one slide are six different
         /// pictures that would otherwise all be called the same thing.
         var fingerprint: String {
             var parts = hidden.map(\.fingerprint)
-            parts.append("t" + (target?.fingerprint ?? "-"))
+            // Spelled, like `outlined` below, so none and one produce exactly
+            // the strings the single-rect version produced. Every card that was
+            // already right keeps its filename and does not re-render.
+            parts.append("t" + (targets.isEmpty
+                                ? "-"
+                                : targets.map(\.fingerprint).joined(separator: "+")))
             // Spelled so that none and one produce exactly the strings the
             // single-rect version produced. Cards that were already right keep
             // their filenames, and only the all-at-once backs -- the ones whose
@@ -180,6 +187,18 @@ struct PageRenderer {
         defer { flags.forEach { $0.shouldDisplay = true } }
         page.draw(with: box, to: context)
 
+        // The same highlight pass the screen uses, inside the same transform the
+        // page was drawn with. Going through one function is what stops the card
+        // and the slide in front of you drifting apart -- which is exactly what
+        // had happened: PDFKit drew both, muddily, and fixing only the screen
+        // would have left every exported slide looking like the old one.
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        // The context is already in page coordinates here -- the same transform
+        // the page itself was drawn with -- so there is nothing to place.
+        PDFEditing.drawHighlights(on: page, box: box) { _ in }
+        NSGraphicsContext.restoreGraphicsState()
+
         if let masks, !masks.isEmpty {
             // Painted inside the same transform the page was drawn with, in page
             // coordinates -- so a mask lands exactly where it was dragged, at any
@@ -188,9 +207,11 @@ struct PageRenderer {
             for rect in masks.hidden {
                 context.fill(rect.rect(in: pageBounds))
             }
-            if let target = masks.target {
+            if !masks.targets.isEmpty {
                 context.setFillColor(Self.targetFill)
-                context.fill(target.rect(in: pageBounds))
+                for rect in masks.targets {
+                    context.fill(rect.rect(in: pageBounds))
+                }
             }
             if !masks.outlined.isEmpty {
                 context.setStrokeColor(Self.targetFill)

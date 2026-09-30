@@ -22,6 +22,10 @@ Using keyboard shortcuts, you can create Anki decks with just a few key strokes,
 - [Kinds of card](#kinds-of-card)
 - [Cropping a slide](#cropping-a-slide)
 - [Editing the PDF](#editing-the-pdf)
+- [Lecture notes](#lecture-notes)
+- [Topics](#topics)
+- [Lecture questions](#lecture-questions)
+- [Tags](#tags)
 - [Checking your cards before you export](#checking-your-cards-before-you-export)
 - [Exporting](#exporting)
 - [Send cards straight to Anki](#send-cards-straight-to-anki)
@@ -104,15 +108,11 @@ Pick the kind at the top of the panel. It applies to the whole panel, so you're 
 
 ### Basic
 
-Your question on the front, the attached slides on the back. This is most cards.
+Your question, its slides, the answer, its slides — all four optional. This is most cards.
 
-### Slide2Slide
+![A basic card](docs/images/Slide%20to%20Slide.png)
 
-The slides *are* the question. Optional text on the front lets you ask something specific about them — *"which step here is rate-limiting?"* — and other slides answer it.
-
-![Slide2Slide](docs/images/Slide%20to%20Slide.png)
-
-Click either slide row to aim ⌘E and ⌘T at it. The armed row has an amber dot.
+Put slides on the question side and the slides *become* the question: *"which step here is rate-limiting?"* with the pathway on the front and the answer on the back. That used to be a separate card type called Slide2Slide; it isn't any more, because a Basic card already does it. Old questions saved as Slide2Slide open as Basic with everything where you left it.
 
 ### Image Occlusion
 
@@ -137,10 +137,15 @@ A sentence with pieces blanked out. Type the line, select the part you want hidd
 
 That makes two cards from one question — one hiding *classical*, one hiding *antibody* — and each keeps its own review history, so adding a third blank later doesn't disturb the two you've been studying.
 
-Two buttons, because there are two things you might mean:
+**Separate cards / One card** decides how the blanks are spread out. Separate is the usual thing — each blank tested on its own. One card blanks all of them at once, for the sentence where the pieces only make sense together. Flip it whenever you like: it re-groups the blanks you have already made, so you don't have to know which you wanted before you made them.
 
-- **Hide selection** (⌘⇧C) — a card of its own.
-- **Add to last card** — hidden at the same time as the blank before it, when two things only make sense together.
+**The chevron beside Hide selection** puts the words on a card you name, instead of a new one. That's how you group blanks that aren't next to each other:
+
+> Protein A leads to inflammation. Protein B leads to growth.
+
+Hide *Protein A* with ⌘⇧C — card 1. Hide *inflammation* — card 2. Now hide *Protein B*, but from the chevron choose **Card 1 · Protein A**, and *growth* → **Card 2 · inflammation**. Four blanks, two cards: one asking which proteins, one asking what they do.
+
+Underneath, the blanks are listed **grouped by the card they're on** — the one thing you can't read off the sentence, since `c1` and `c3` four lines apart look identical at a glance. **Drag a blank onto another card** to move it, or onto the dashed well at the bottom to give it a card of its own. Clicking the words opens the same choice as a menu, for when a drag is more trouble than it's worth. The ✕ un-hides them.
 
 Slides attach to the back, the same way they do on a Basic card: the sentence tests you, and the slide is there to look at once you've answered. The answer field goes with them.
 
@@ -148,11 +153,31 @@ The panel tells you how many cards the question makes as you type. If nothing is
 
 ### Your own question shapes
 
-If you notice you're typing the same shape for a third time — *"A patient presents with ___. What is the diagnosis?"* — make it a template. Settings ▸ Templates ▸ New Template, then select a phrase and press ⌘B to turn it into a blank.
+If you notice you're typing the same shape for a third time — *"A patient presents with ___. What is the diagnosis?"* — make it a template. Settings ▸ Templates ▸ New Template, then select a phrase and press ⌘B to turn it into a blank. **New from Question** starts one from whatever card you have open.
 
 ![A template in use](docs/images/Custom%20Question%20Type.png)
 
-**Slides on** decides whether cards from that template carry their slides on the front, the back, or both. Deleting a template turns its questions into Basic ones, keeping the text exactly as it reads — nothing is lost.
+A template gets its own tab, and cards written in that shape collect there — including ones you typed out by hand before the template existed. Matching is on the wording of the question only, so changing an answer or a tag never moves a card out from under you.
+
+**Slides go on** picks which slide row ⌘T aims at when you open one of these — both rows are always there, this just saves you clicking the usual one. **Tags** are applied to every card you make in it. A template can make Occlusion or Cloze cards as well as Basic ones.
+
+**A template can't damage a card.** It isn't stored on one: a card you write through a template is an ordinary Basic card holding its own finished words, and the template only recognises those words afterwards. Turn a template off, edit it, delete it — every card keeps every word and simply moves back to the Basic tab.
+
+Two shapes come with the app — **CC — disease** and **CC — presentation**, for clinical correlations. You can edit them or switch them off, but not delete them. Everything else you make can be switched off too, for the shape you want this term and not next.
+
+---
+
+## Tags
+
+Every card has a row of tag checkboxes at the bottom, and every one of them goes onto the Anki note. Which tags are offered is set in Settings ▸ Tags — the switch turns a tag off without losing it, the pin decides whether it gets a permanent checkbox or lives behind the tag button. The tags AnkiFlow ships with can be renamed and turned off but not deleted; they'd only come back on the next launch.
+
+**Yield is one button that says what it is.** Click it to walk *Normal → High → Low* and round again. Normal is the default and **carries no tag at all** — most cards are ordinary, and a tag that nine cards in ten are wearing is a search term you can never use. So only the two ends get marked, which also means every card you wrote before yields existed already reads as normal.
+
+**Tags are lowercase and never contain a space.** Type "High Yield" and you get `high-yield`. Anki splits its tag field on whitespace, so a tag with a space in it arrives there as two tags, neither of which is the one you meant.
+
+**Making the text bigger.** ⌘+ and ⌘− resize the notes, ⌘0 puts them back — same as the aA buttons in the notes toolbar, and they're in the View menu too. The size survives quitting.
+
+**Filtering.** The chips under the card-type tabs narrow the list to cards carrying *every* tag you pick, and the counts on the tabs follow — so a tab reading zero really is empty under this filter. A question you make while a filter is on is born with those tags, so writing under a filter never produces a card the filter then hides. The filter is forgotten when you close the app.
 
 ---
 
@@ -180,36 +205,96 @@ Everything above leaves your lecture file untouched. This doesn't — it's the o
 
 **Nothing is written until you say so.** Marks appear as you make them, but they live in memory until you press **⌘S** (or the **Save** button, which appears the moment there's something to save). **⌘Z** undoes the last PDF edit and **⇧⌘Z** redoes it. Leaving with unsaved marks asks first.
 
-Text boxes appear at a default size when clicked. Select a text box to change its color, fill, size, bold, or italic style; selecting part of its text applies bold or italic only to that selection. These settings remain the defaults for the next text box.
+## Lecture notes
 
-While editing a text box, **⌘B** toggles bold, **⌘I** toggles italic, and **⌘U** toggles underline. **⌘Z** undoes the last PDF edit and **⇧⌘Z** redoes it. Text-box formatting remains visible after you click away and when you view the PDF.
+Cards are for details. Notes are for the shape of the thing — what this lecture was actually about, the bit that finally made sense, the question you want to ask someone.
 
-**Marking up a slide.**
+The notes pane sits at the bottom of the right panel (**⌘4** to hide or show it, and you can drag the divider). It's an ordinary rich text editor: **bold** (⌘B), *italic* (⌘I), underline (⌘U), ~~strikethrough~~ (⇧⌘X), a link (⌘K), three sizes of heading, and bullets.
 
-| Tool | |
-|---|---|
-| **Select text** | Then click Highlight, Underline or Strikethrough |
-| **Select** | Click a mark to pick it up. Drag to move it, drag a corner to resize, ⌫ to delete. Double-click a text box to retype it — including one you saved weeks ago |
-| **Sketch** | Draw freehand |
-| **Shapes** | Rectangle, oval, line, arrow. Click for the last one you used, hold for the rest |
-| **Text** | Click to place a default-size box, then type; resize the box if needed |
-| **Trim** | Drag to cut the slide down to that rectangle |
+**Bigger or smaller text.** The two buttons at the right of the toolbar change how large your notes are drawn, from small to quite large. It's a display setting — it changes nothing in the file, and every lecture opens at the size you last chose.
 
-The swatch next to them holds the stroke colour, the fill (or no fill), the line thickness and the text size. Changing the colour with something selected recolours it.
+**Folding.** A bullet with bullets underneath it gets a small triangle in the left margin. Click it to fold that section away while you read, and again to bring it back. Folding is just for looking at — nothing is added to or removed from the file.
 
-Marks are real PDF annotations, so they show up in Preview, GoodNotes, or wherever else you read the file — and because they're part of the page, they appear on every card that uses that slide.
+Those keys only mean that while you're typing in a note; ⌘Z undoes there, the same as it does everywhere else in the app. Press a button with nothing selected and the next thing you type comes out in that style, the way it does in any editor.
 
-**Rearranging slides.** Rotate, insert and delete are behind the pages button in the bar, and in the PDF menu. Drag slides in the gallery to reorder them. Reordering is held in memory with your other PDF edits and is written only when you click Save; undo or discard works before then. When slides move, **your questions move with them**.
+There's no colour well and no font picker, on purpose — Markdown has no way to record either, so those buttons would style the text on screen and lose it on save. Bigger text is a heading, which is the answer the format already has.
 
-Deleting a slide is the only action here that asks first. Everything else you can put back by doing the opposite; a deleted page is gone from the file.
+**Where it goes.** A plain `.md` file beside the PDF, named after it: `Innate Immunity.pdf` gets `Innate Immunity Notes.md`. Real Markdown, the kind you'd have typed yourself. Open it in Obsidian, on your phone, in TextEdit, in ten years.
 
-**Trimming.** After trimming one slide, **Trim Every Slide Like This One** applies the same margins to the whole lecture — a deck exported with the same header on all sixty slides gets fixed once. Trimming moves the page's edges, so anything you've already cropped or masked on those slides is re-measured against the new ones and keeps pointing at the same part of the picture.
+It follows the lecture the way your questions do: rename or move the PDF and the note goes with it, delete the lecture and the note goes to the Trash with it, and if the pair ever gets separated, orphan recovery brings both back together.
 
-After any of this, your slide images re-render and the affected cards update in Anki on the next export. Your review history is untouched.
+**The file is the truth.** Empty the note and the `.md` is removed rather than left behind as a blank. Edit it in Obsidian and the pane picks the change up within a couple of seconds. Delete it in Finder and the pane empties to match, and says so — deleting a note is a decision, not an accident to be quietly undone.
+
+---
+
+## Topics
+
+A topic is a name and how well you know it. Nothing else — the writing about it goes in the notes.
+
+The panel sits at the foot of the library sidebar, on a divider you can drag. Type a name, press return, and it joins the list. Each row has one button that steps through **Low, Medium, High, Mastered** and back round again. Double-click a topic to rename it; the ✕ on hover deletes it.
+
+**Three views**, from the switch at the top. *Lecture* is the one you have open. *Folder* is everything in that lecture's folder. *Library* is the lot, grouped by lecture — click a lecture name to open it. Rating and deleting work in all three, so you can go through a whole block without opening a single lecture.
+
+**The list holds still while you work.** Rating a topic doesn't move it, so nothing jumps out from under your cursor mid-session. The circular arrow at the top sorts when you're ready — least comfortable first — and in the folder and library views it also picks up anything you've changed elsewhere.
+
+**Where it goes.** The top of the same `.md` as your notes, so opening the file anywhere shows the list above the writing it belongs to:
+
+```markdown
+<!-- ankiflow:topics -->
+
+## Topics
+
+- Wiggers diagram — low
+- Preload vs afterload — medium
+- Ejection fraction — mastered
+
+<!-- /ankiflow:topics -->
+```
+
+Always sorted, least comfortable first. The `<!-- -->` lines are invisible anywhere the Markdown is rendered, and the notes editor never shows this block at all — it shows your writing and nothing else.
+
+**Edit it anywhere.** Type `- Baroreflex` into the file by hand and it appears here rated Low, tidied into place a second later. Delete the last topic and the whole block goes; empty the file completely and the file goes too.
+
+---
+
+## Lecture questions
+
+The pane between your cards and your notes, for the thing that didn't land while the lecturer was still talking. Write it down fast, tick it off once you can answer it.
+
+Think of these as draft cards. They have everything a real card has — a question, an answer, slides on either side, tags — they just aren't in your question file yet, because they aren't finished.
+
+Each row has a checkbox and a caret. Tick one when you can answer it — it stays in the list, struck through, with a tally at the top so you can see what's left. The caret opens the answer box, both slide rows and the tags. The slide rows work exactly as they do on a card: click one to aim ⌘T and ⌘E at it, click again to type page numbers.
+
+Double-click a question to reword it; the ✕ on hover deletes it.
+
+**Turning one into a card.** **Move *n* to Cards** at the top takes across every question that's ticked *and* has an answer — written words or an attached slide, either counts. A slide on the *question* side doesn't count as an answer. The arrow on a row does one at a time. Everything crosses over: question, answer, both slide rows, your tags, plus a `lecture-question` tag so you can always find the cards you wrote during a lecture. It leaves the questions list when it does, and ⌘Z puts it back.
+
+**The list holds still while you work**, same as topics — ticking never reorders it, and the circular arrow sorts unanswered to the top when you ask. Unlike topics, the file keeps them in the order you asked them.
+
+**Where it goes.** A second block in the same `.md`, under the topics, using ordinary task-list checkboxes — so VS Code and GitHub render real tick boxes, and you can tick one there:
+
+```markdown
+<!-- ankiflow:questions -->
+
+## Lecture Questions
+
+- [x] Why does a stiff ventricle raise filling pressure without raising volume?
+  > Compliance is the slope of the diastolic P–V curve, so the same volume
+  > sits higher up a steeper line.
+  > Question slides: 11
+  > Slides: 12, 14
+  > Tags: high-yield, physiology
+- [ ] Why is isovolumetric relaxation energy-dependent?
+
+<!-- /ankiflow:questions -->
+```
+
+The answer is a blockquote under its question, which is exactly what the caret folds. Add `- [ ] Why…` by hand and it turns up here unanswered.
 
 ---
 
 ## Checking your cards before you export
+
 
 Press **⌘P**. You see your cards the way they'll appear, drawn by the same code that builds the deck — and it opens on the card you were just working on, so checking the one you've written is one keystroke rather than a scroll.
 
@@ -280,13 +365,21 @@ Nothing is hidden in a database.
 YourLectures/                    ← the folder you opened
 ├── Immunology/
 │   ├── Lecture 04.pdf
-│   └── Lecture 04.ankiflow.json ← your questions for that lecture
-└── .ankiflow/                   ← settings, image cache, undo history
+│   ├── Lecture 04.ankiflow.json ← your questions for that lecture
+│   └── Lecture 04 Notes.md      ← your notes, topics and lecture questions
 ```
 
-Your questions sit next to the PDF they belong to, as plain readable text. They're hidden in Finder by default (press ⇧⌘. to see them), and a lecture with no questions gets no file at all.
+**AnkiFlow writes nothing else into your folders.** Your questions sit next to the PDF they belong to as plain readable text, your notes next to that, and that is the whole of it. They're hidden in Finder by default (press ⇧⌘. to see them), and a lecture with no questions gets no file at all.
 
-**Questions save automatically.** PDF markup and slide reordering are separate: while editing a PDF, click Save to write those changes into the PDF. ⌘⏎ finishes a question and folds it shut; ⌘Z undoes, ⇧⌘Z redoes, and question history survives quitting the app.
+Everything the app needs for itself lives with the app: **settings and templates** in `~/Library/Application Support/AnkiFlow/`, and **rendered slide images** in `~/Library/Caches/AnkiFlow/`, where macOS can reclaim them when the disk gets tight and Time Machine knows to skip them. Clear the cache whenever you like — the next export just takes longer.
+
+If you used an earlier version you'll have a `.ankiflow` folder sitting in your library. It's read once for your old settings and then never touched again; AnkiFlow says so when it notices, and you can delete it.
+
+**Questions save automatically.** PDF markup and slide reordering are separate: while editing a PDF, click Save to write those changes into the PDF. ⌘⏎ finishes a question and folds it shut; ⌘Z undoes and ⇧⌘Z redoes.
+
+**Undo covers the session you're in.** ⌘Z takes back the last thing you did in whatever you're working on — a card, a mark on a slide, a topic, a line of text. Closing AnkiFlow starts fresh: nothing from yesterday comes back tomorrow.
+
+**Marks on a slide are the exception to autosave**, so they're the one thing you get asked about. Quit with unsaved marks and AnkiFlow offers to write them into the PDF, throw them away, or stay put.
 
 **Renaming and moving lectures.** Do it inside AnkiFlow — **drag a lecture onto a folder** to move it, and right-click for Rename or Move to Trash — and your questions travel with the PDF. If you do move a PDF in Finder and leave its questions behind, AnkiFlow notices next time it scans the library and offers to put them back together, showing you which lecture it thinks they belong to and why.
 
@@ -314,16 +407,16 @@ Every one of these is a menu command, so they work while your cursor is in a tex
 | ⌘⏎ | Finish this question |
 | ⌘⇧C | Hide the selected words on a cloze card |
 | ⌘⌫ | Delete this question |
-| ⌘U | Underline selected text while editing a PDF |
-| ⌘Z / ⇧⌘Z | Undo / redo — your questions, or your PDF edits while editing |
-| ⌘B / ⌘I | Bold / italicize selected text while editing a PDF |
+| ⌘B ⌘I ⌘U | Bold, italic, underline — PDF markup while editing, note text while writing one |
+| ⌘Z / ⇧⌘Z | Undo / redo — your questions, your PDF marks while editing, or your typing inside a note |
 | ⌘S | Save your marks into the PDF (while editing) |
 | ⌘Y | Switch card kind |
 | ⌘P | Preview your cards |
 | ⌘D | Export |
 | ⌘O | Open a different folder of lectures |
 | ⌘F ⇧⌘F ⌥F ⌥⌘F | Find (Search local slides, library slides, local questions, library questions)|
-| ⌘1 ⌘2 | Sidebar / slide gallery |
+| ⌘1 ⌘2 ⌘3 ⌘4 | Sidebar / slide gallery / flagged pages / notes |
+| ⇧⌘X ⌘K | In a note: strikethrough, link |
 | View ▸ Show Flagged Pages Only | Limit navigation and the gallery to bookmarked pages |
 | ⌘? | This documentation, inside the app |
 

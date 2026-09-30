@@ -1,7 +1,15 @@
 import Foundation
+import Combine
 import PDFKit
 
-/// Where AnkiFlow keeps its own files inside a lecture library.
+/// The `.ankiflow` folder AnkiFlow used to keep inside every library.
+///
+/// Nothing is written here any more. The settings that lived in `library.json`
+/// belong to the app now, the image cache moved to the system cache directory
+/// where a cache belongs, and the save snapshots are gone. What remains is the
+/// name — so a folder left over from an older version is still recognised and
+/// skipped when the library is scanned, and its settings can still be read once
+/// on the way past.
 enum LibraryPaths {
     static let dotDirectoryName = ".ankiflow"
 
@@ -9,50 +17,164 @@ enum LibraryPaths {
         root.appendingPathComponent(dotDirectoryName, isDirectory: true)
     }
 
+    /// Read once, by `SettingsStore.adoptOldLibraryFile`. Never written.
     static func settingsURL(inLibrary root: URL) -> URL {
         dotDirectory(inLibrary: root).appendingPathComponent("library.json")
     }
 
-    static func cacheDirectory(inLibrary root: URL) -> URL {
-        dotDirectory(inLibrary: root).appendingPathComponent("cache", isDirectory: true)
+    /// True when an old folder is still sitting in the library, so the app can
+    /// say it is now safe to throw away.
+    static func hasLeftovers(inLibrary root: URL) -> Bool {
+        FileManager.default.fileExists(atPath: dotDirectory(inLibrary: root).path)
     }
+}
 
-    /// Walk up from a sidecar until we find the library root (the folder holding
-    /// `.ankiflow`), so history lands in one place per library.
-    static func historyDirectory(forSidecar sidecar: URL) -> URL? {
-        var dir = sidecar.deletingLastPathComponent()
-        for _ in 0..<12 {
-            let candidate = dir.appendingPathComponent(dotDirectoryName, isDirectory: true)
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                return candidate.appendingPathComponent("history", isDirectory: true)
-            }
-            let parent = dir.deletingLastPathComponent()
-            if parent.path == dir.path { break }
-            dir = parent
-        }
-        return nil
+/// Where AnkiFlow keeps its own files, none of them inside your lectures.
+enum AppPaths {
+    /// Rendered slide images.
+    ///
+    /// `~/Library/Caches`, which is what a cache directory is for: the system
+    /// reclaims it under disk pressure and Time Machine skips it, neither of
+    /// which was true when this sat inside somebody's coursework folder. One
+    /// cache for every library — the filenames already carry the PDF's own hash,
+    /// so two libraries cannot collide.
+    static var cacheDirectory: URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return caches.appendingPathComponent(AnkiIdentity.appName, isDirectory: true)
+            .appendingPathComponent("slides", isDirectory: true)
     }
 }
 
 // MARK: - Tags
+
+/// How much a card matters: three levels, two tags.
+///
+/// Normal is the default and carries no tag at all, which is the whole point.
+/// Most cards are ordinary, a tag every card wears says nothing, and a
+/// collection where `-normal-yield` matches nine cards in ten is a search term
+/// you can never use. So the two ends are marked and the middle is simply the
+/// absence of a mark -- which also means a card written before yields existed
+/// already reads as normal, with nothing to migrate.
+enum Yield: String, CaseIterable, Identifiable {
+    case normal, high, low
+
+    var id: String { rawValue }
+
+    /// Nil for normal, which is what makes it the default.
+    var tag: String? { self == .normal ? nil : "\(rawValue)-yield" }
+
+    var label: String {
+        switch self {
+        case .high:   return "High yield"
+        case .normal: return "Normal yield"
+        case .low:    return "Low yield"
+        }
+    }
+
+    /// The button walks the rungs and wraps. Ordered so the common answer is one
+    /// click from the default: most of what you mark is high-yield.
+    var next: Yield {
+        let rungs = Yield.allCases
+        return rungs[((rungs.firstIndex(of: self) ?? 0) + 1) % rungs.count]
+    }
+
+    var symbol: String {
+        switch self {
+        case .high:   return "circle.fill"
+        case .normal: return "circle.lefthalf.filled"
+        case .low:    return "circle"
+        }
+    }
+
+    /// What a set of tags says the yield is. Unmarked means normal.
+    static func of(_ tags: [String]) -> Yield {
+        if tags.contains("high-yield") { return .high }
+        if tags.contains("low-yield") { return .low }
+        return .normal
+    }
+}
+
+/// A short label you can put on a slide, drawn beside the flag in the corner
+/// of the page and written into the PDF as an annotation -- so it is there in
+/// Preview, on the iPad, and in the exported slide image.
+struct PageTagDefinition: Codable, Identifiable, Equatable {
+    var label: String
+    var enabled: Bool = true
+
+    var id: String { label }
+}
 
 /// A tag you can put on cards. `pinned` tags get a permanent checkbox at the
 /// bottom of the question panel; the rest live behind the "More tags" field.
 struct TagDefinition: Codable, Identifiable, Equatable {
     var name: String
     var pinned: Bool
+    /// Off means it stays in the list and stops being offered anywhere else --
+    /// no checkbox, no filter chip. For the tag you use in one course and not
+    /// the next, which is not the same as being finished with it.
+    var enabled: Bool
 
     var id: String { name }
 
-    init(name: String, pinned: Bool = true) {
+    init(name: String, pinned: Bool = true, enabled: Bool = true) {
         self.name = name
         self.pinned = pinned
+        self.enabled = enabled
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         name = try c.decode(String.self, forKey: .name)
         pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? true
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+    }
+
+    /// The tags the app ships with. Editable and switchable off, but not
+    /// deletable -- they would come back on the next launch anyway, and a delete
+    /// that quietly undoes itself is worse than one that isn't offered.
+    static let defaults: [String] = yields + ["clinical-correlation", "drug-info"]
+
+    var isDefault: Bool { TagDefinition.defaults.contains(name) }
+
+    /// A tag never contains a space.
+    ///
+    /// Anki splits a note's tag field on whitespace, so "high yield" typed here
+    /// arrives there as two tags, `high` and `yield`, and neither is the one you
+    /// meant to search for. Hyphenating on the way in means the tag you see in
+    /// this app is the tag you get in your collection. Everywhere a tag can be
+    /// typed goes through here.
+    static func normalise(_ raw: String) -> String {
+        raw.lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+    }
+
+    /// The yield tags that actually exist.
+    ///
+    /// Two, not three -- see `Yield`. Kept here rather than in the panel because
+    /// it is a fact about the vocabulary, not about one control: the filter row,
+    /// the template editor and the tag bar all need to know that picking one of
+    /// these unpicks the other.
+    static let yields = Yield.allCases.compactMap(\.tag)
+
+    /// The same rule, applied while someone is still typing.
+    ///
+    /// `normalise` trims, which is right on commit and wrong on every keystroke
+    /// before it: the space in "high yield" is a trailing space at the moment it
+    /// is typed, so trimming ate it and the field filled up with "highyield".
+    /// This one only ever substitutes, so the text can still be finished.
+    static func normaliseLive(_ raw: String) -> String {
+        raw.lowercased().replacingOccurrences(of: " ", with: "-")
+    }
+
+    /// `normal-yield` is in here and not in `yields`: it is not a tag this app
+    /// hands out any more, but one written by an earlier build has to be swept
+    /// away when a yield is set rather than left sitting alongside the new one.
+    static func isYield(_ name: String) -> Bool {
+        yields.contains(name) || name == "normal-yield"
     }
 }
 
@@ -72,57 +194,92 @@ enum ImageFormat: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-/// Per-library settings, stored in `.ankiflow/library.json`.
-struct LibrarySettings: Codable, Equatable {
+/// Settings, stored once for the app rather than once per folder of lectures.
+///
+/// They used to live in `.ankiflow/library.json` inside each library, and none
+/// of them were really about a folder: image width, whether question files are
+/// hidden, and the tag vocabulary are answers you give once and want everywhere.
+/// The tag list in particular was never load-bearing -- a card's tags are on the
+/// card -- so a per-library copy of it was a second place for the same fact to
+/// drift.
+struct AppSettings: Codable, Equatable {
     var imageWidth: Int = 1600
     var imageFormat: ImageFormat = .auto
     var jpegQuality: Double = 0.82
     var revealAfterExport: Bool = true
     /// Bumped when rendering settings change, so cached images and content
     /// hashes both invalidate together.
-    var renderVersion: Int = 1
-    /// The top-level Anki deck everything hangs off. Editable, but see the
-    /// warning in Settings: existing cards never move deck on re-import, so
-    /// changing this after an export splits your collection in two.
+    /// Bump when the drawing changes, so cards already in Anki get the new
+    /// picture. 2: highlights are multiplied into the slide rather than laid
+    /// over it, which changes every slide carrying one.
+    var renderVersion: Int = 2
+    /// The deck everything hangs off, above the library.
+    ///
+    /// The library folder's own name comes next, then its folders, then the
+    /// lecture -- so one root can hold several libraries side by side without
+    /// their decks running together. Leave it empty and there is no level above
+    /// the library at all.
+    ///
+    /// Editable, but see the warning in Settings: existing cards never move deck
+    /// on re-import, so changing this after an export splits your collection.
     var deckRoot: String = AnkiIdentity.deckRoot
     /// Keep the per-lecture question files out of Finder's way. They sit beside
     /// your PDFs, so by default they're hidden rather than doubling the
     /// apparent contents of every folder.
     var hideSidecarFiles: Bool = true
+    /// Watch Anki while it is open, and pull back edits that only happened
+    /// there. Conflicts and deletions are never applied on their own; see
+    /// `AppState.pollAnki`.
+    var autoSyncFromAnki: Bool = true
+    /// Sections of the topics panel, in the order they are shown.
+    var topicTypes: [TopicType] = TopicType.defaults
     /// Tags offered in the question panel. Order here is the order shown.
-    var tags: [TagDefinition] = LibrarySettings.starterTags
+    var tags: [TagDefinition] = AppSettings.starterTags
+    /// Short labels you can put on a *slide*, beside the flag. Nothing to do
+    /// with the tags above: those go on cards and reach Anki, these are marks
+    /// on the PDF itself and stay in the PDF.
+    var pageTags: [PageTagDefinition] = AppSettings.starterPageTags
 
-    static let starterTags: [TagDefinition] = [
-        TagDefinition(name: "high-yield"),
-        TagDefinition(name: "clinical-correlation")
+    static let starterPageTags: [PageTagDefinition] = [
+        PageTagDefinition(label: "CC"), PageTagDefinition(label: "HY")
     ]
 
-    /// Never empty, and never containing "::" -- that separates deck levels.
+    /// What the menu offers. A tag switched off keeps every mark you have
+    /// already made -- it is still drawn on the slides that carry it and can
+    /// still be taken off -- it just stops being offered for new ones.
+    var activePageTags: [PageTagDefinition] { pageTags.filter(\.enabled) }
+
+    static let starterTags: [TagDefinition] = TagDefinition.defaults.map {
+        // Yield has its own button, so pinning it would only put it in the
+        // checkbox row twice.
+        TagDefinition(name: $0, pinned: !TagDefinition.isYield($0))
+    }
+
+    /// Defaults are always in the list, however the file arrived.
+    static func withDefaults(_ tags: [TagDefinition]) -> [TagDefinition] {
+        var out = tags
+        for tag in starterTags where !out.contains(where: { $0.name == tag.name }) {
+            out.append(tag)
+        }
+        return out
+    }
+
+    /// What the checkboxes and the filter row offer.
+    var activeTags: [TagDefinition] { tags.filter(\.enabled) }
+
+    /// May be empty -- that means no level above the library. Never contains
+    /// "::", which is what separates deck levels.
     var resolvedDeckRoot: String {
-        LibrarySettings.sanitisedDeckRoot(deckRoot)
+        AppSettings.sanitisedDeckRoot(deckRoot)
     }
 
     static func sanitisedDeckRoot(_ raw: String) -> String {
-        let cleaned = raw
-            .replacingOccurrences(of: "::", with: "-")
+        raw.replacingOccurrences(of: "::", with: "-")
             .trimmingCharacters(in: .whitespaces)
-        return cleaned.isEmpty ? AnkiIdentity.deckRoot : cleaned
     }
 
-    /// What a brand-new library starts with: its own folder name.
-    ///
-    /// Applied only when there is no settings file yet. A library that has one
-    /// keeps whatever it says, even if that is the old "AnkiFlow" default --
-    /// changing an existing library's deck root would leave every card already
-    /// in Anki sitting under the old name, because Anki never moves existing
-    /// cards between decks on import. Splitting someone's collection in two is
-    /// not a thing to do on their behalf.
-    static func defaultDeckRoot(for root: URL) -> String {
-        sanitisedDeckRoot(root.lastPathComponent)
-    }
-
-    var pinnedTags: [TagDefinition] { tags.filter(\.pinned) }
-    var unpinnedTags: [TagDefinition] { tags.filter { !$0.pinned } }
+    var pinnedTags: [TagDefinition] { activeTags.filter(\.pinned) }
+    var unpinnedTags: [TagDefinition] { activeTags.filter { !$0.pinned } }
 
     init() {}
 
@@ -132,10 +289,18 @@ struct LibrarySettings: Codable, Equatable {
         imageFormat = try c.decodeIfPresent(ImageFormat.self, forKey: .imageFormat) ?? .auto
         jpegQuality = try c.decodeIfPresent(Double.self, forKey: .jpegQuality) ?? 0.82
         revealAfterExport = try c.decodeIfPresent(Bool.self, forKey: .revealAfterExport) ?? true
-        renderVersion = try c.decodeIfPresent(Int.self, forKey: .renderVersion) ?? 1
+        renderVersion = try c.decodeIfPresent(Int.self, forKey: .renderVersion) ?? 2
         deckRoot = try c.decodeIfPresent(String.self, forKey: .deckRoot) ?? AnkiIdentity.deckRoot
         hideSidecarFiles = try c.decodeIfPresent(Bool.self, forKey: .hideSidecarFiles) ?? true
-        tags = try c.decodeIfPresent([TagDefinition].self, forKey: .tags) ?? LibrarySettings.starterTags
+        tags = AppSettings.withDefaults(
+            try c.decodeIfPresent([TagDefinition].self, forKey: .tags) ?? AppSettings.starterTags)
+        // These three were being written to the file and never read back, so
+        // every launch quietly restored the defaults over whatever you had set.
+        autoSyncFromAnki = try c.decodeIfPresent(Bool.self, forKey: .autoSyncFromAnki) ?? true
+        topicTypes = try c.decodeIfPresent([TopicType].self, forKey: .topicTypes)
+            ?? TopicType.defaults
+        pageTags = try c.decodeIfPresent([PageTagDefinition].self, forKey: .pageTags)
+            ?? AppSettings.starterPageTags
     }
 }
 
@@ -149,7 +314,107 @@ struct LibraryNode: Identifiable, Equatable {
 
     var id: String { url.path }
     var name: String {
-        isFolder ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
+        isFolder ? url.finderName : url.lectureName
+    }
+}
+
+/// The one place settings live.
+///
+/// A singleton because there is one app and one set of preferences in it, and
+/// threading a store through `Library`, `PageRenderer`, the exporter and every
+/// view that shows a checkbox would be a lot of plumbing to express "there is
+/// only one of these".
+@MainActor
+final class SettingsStore: ObservableObject {
+    static let shared = SettingsStore()
+
+    @Published var settings: AppSettings {
+        didSet {
+            // The file writer reads the order from here rather than being handed
+            // it at every call site.
+            TopicType.order = settings.topicTypes.map(\.name)
+            save()
+        }
+    }
+
+    let fileURL: URL
+
+    init(directory: URL? = nil) {
+        let root: URL
+        if let directory {
+            root = directory
+        } else {
+            let support = FileManager.default
+                .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSHomeDirectory())
+                    .appendingPathComponent("Library/Application Support")
+            root = support.appendingPathComponent(AnkiIdentity.appName, isDirectory: true)
+        }
+        self.fileURL = root.appendingPathComponent("Settings.json")
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        if let data = try? Data(contentsOf: fileURL),
+           var loaded = try? JSONDecoder().decode(AppSettings.self, from: data) {
+            // A default tag added in a later version has to reach a settings
+            // file written by an earlier one, or it exists in the source and
+            // nowhere you can see it. Appended, never reordered, and only when
+            // missing -- a default you have switched off stays off.
+            let known = Set(loaded.tags.map(\.name))
+            for name in TagDefinition.defaults where !known.contains(name) {
+                loaded.tags.append(TagDefinition(name: name))
+            }
+            // Highlights are drawn differently now, so every slide carrying one
+            // has to be re-rendered and re-exported. Bumping the stored version
+            // once is what reaches cards already in Anki; leaving it at 1 would
+            // have fixed the screen and left the cards muddy.
+            if loaded.renderVersion < 2 { loaded.renderVersion = 2 }
+            // Same for topic types, and for the same reason.
+            let types = Set(loaded.topicTypes.map(\.id))
+            for type in TopicType.defaults where !types.contains(type.id) {
+                loaded.topicTypes.append(type)
+            }
+            self.settings = loaded
+        } else {
+            self.settings = AppSettings()
+        }
+        TopicType.order = self.settings.topicTypes.map(\.name)
+    }
+
+    /// Take over from a library's own `library.json`, once.
+    ///
+    /// Everything but the deck root comes across as it stands. The deck root
+    /// does not, because it used to mean "the top level" and now means "the
+    /// level above the library" -- carrying it over would name a library after
+    /// itself twice. `hasMigrated` is what the change notice reads to tell you
+    /// your deck names gained a level.
+    @discardableResult
+    func adoptOldLibraryFile(inLibrary root: URL) -> Bool {
+        let old = LibraryPaths.settingsURL(inLibrary: root)
+        guard !FileManager.default.fileExists(atPath: fileURL.path),
+              let data = try? Data(contentsOf: old),
+              let loaded = try? JSONDecoder().decode(AppSettings.self, from: data) else { return false }
+        var adopted = loaded
+        adopted.deckRoot = AnkiIdentity.deckRoot
+        settings = adopted
+        hasMigrated = true
+        return true
+    }
+
+    /// Set for the run in which settings were lifted out of a library, and
+    /// cleared by the first reader -- it is a notice to deliver once, not a
+    /// state to be in, and left standing it re-announced itself every time
+    /// another library was opened.
+    private var hasMigrated = false
+
+    func consumeMigrationNotice() -> Bool {
+        defer { hasMigrated = false }
+        return hasMigrated
+    }
+
+    private func save() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(settings) else { return }
+        try? AtomicWrite.write(data, to: fileURL)
     }
 }
 
@@ -157,23 +422,27 @@ struct LibraryNode: Identifiable, Equatable {
 final class Library: ObservableObject {
     @Published private(set) var root: URL
     @Published private(set) var tree: [LibraryNode] = []
-    @Published var settings: LibrarySettings { didSet { saveSettings() } }
+    /// Settings are the app's, not this folder's -- this is a passthrough so
+    /// that `library.settings.x` still reads the way it always did.
+    var settings: AppSettings {
+        get { SettingsStore.shared.settings }
+        set { SettingsStore.shared.settings = newValue }
+    }
+
+    private var settingsObserver: AnyCancellable?
 
     init(root: URL) {
         self.root = root
-        let settingsURL = LibraryPaths.settingsURL(inLibrary: root)
-        if let data = try? Data(contentsOf: settingsURL),
-           let loaded = try? JSONDecoder().decode(LibrarySettings.self, from: data) {
-            self.settings = loaded
-        } else {
-            var fresh = LibrarySettings()
-            fresh.deckRoot = LibrarySettings.defaultDeckRoot(for: root)
-            self.settings = fresh
+        // Views watch the library, and settings no longer live on it, so a
+        // change to one has to reach them through here or nothing redraws.
+        settingsObserver = SettingsStore.shared.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
         }
+        SettingsStore.shared.adoptOldLibraryFile(inLibrary: root)
         rescan()
     }
 
-    var name: String { root.lastPathComponent }
+    var name: String { root.finderName }
 
     /// A cheap summary of the library's shape on disk, for noticing that
     /// something changed outside the app.
@@ -231,7 +500,10 @@ final class Library: ObservableObject {
     /// Returns the lecture's new URL.
     @discardableResult
     func rename(_ pdfURL: URL, to newName: String) throws -> URL {
-        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A slash you typed is a colon on disk, the same swap the Finder makes.
+        // Handed straight to `appendingPathComponent` it would read as a path
+        // separator and the rename would land somewhere else entirely.
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines).asPOSIXName
         guard !trimmed.isEmpty else { throw FileError.failed("A lecture needs a name.") }
         let folder = pdfURL.deletingLastPathComponent()
         let target = folder.appendingPathComponent(trimmed).appendingPathExtension("pdf")
@@ -249,10 +521,8 @@ final class Library: ObservableObject {
     private func relocate(_ pdfURL: URL, to target: URL) throws -> URL {
         let manager = FileManager.default
         guard !manager.fileExists(atPath: target.path) else {
-            throw FileError.exists(target.lastPathComponent)
+            throw FileError.exists(target.finderName)
         }
-        let sidecar = pdfURL.deletingPathExtension()
-            .appendingPathExtension(AnkiIdentity.sidecarExtension)
         let newSidecar = target.deletingPathExtension()
             .appendingPathExtension(AnkiIdentity.sidecarExtension)
 
@@ -263,23 +533,33 @@ final class Library: ObservableObject {
             try? manager.removeItem(at: newSidecar)
         }
         guard !manager.fileExists(atPath: newSidecar.path) else {
-            throw FileError.exists(newSidecar.lastPathComponent
+            throw FileError.exists(newSidecar.finderName
                 + " — there are already questions filed under that name")
         }
 
         do {
             try manager.moveItem(at: pdfURL, to: target)
         } catch {
-            throw FileError.failed("Couldn't move \(pdfURL.lastPathComponent): \(error.localizedDescription)")
+            throw FileError.failed("Couldn't move \(pdfURL.finderName): \(error.localizedDescription)")
         }
-        // The questions follow. If this half fails the pair is separated, so put
-        // the PDF back rather than leaving a mess recovery has to clean up.
-        if manager.fileExists(atPath: sidecar.path) {
+        // The questions and notes follow. If any of it fails the set is
+        // separated, so everything already moved goes back rather than leaving a
+        // mess recovery has to clean up.
+        var undo: [(from: URL, to: URL)] = [(from: target, to: pdfURL)]
+        for kind in AnkiIdentity.Companion.allCases {
+            let companion = kind.url(for: pdfURL)
+            guard manager.fileExists(atPath: companion.path) else { continue }
+            // Both ends from the same case. The question file appends an
+            // extension and the note file appends a word too, so a destination
+            // rebuilt from the source's own path extension gets one of them
+            // wrong -- and getting it wrong orphans the file.
+            let destination = kind.url(for: target)
             do {
-                try manager.moveItem(at: sidecar, to: newSidecar)
+                try manager.moveItem(at: companion, to: destination)
+                undo.append((from: destination, to: companion))
             } catch {
-                try? manager.moveItem(at: target, to: pdfURL)
-                throw FileError.failed("Couldn't move \(sidecar.lastPathComponent): "
+                for step in undo { try? manager.moveItem(at: step.from, to: step.to) }
+                throw FileError.failed("Couldn't move \(companion.finderName): "
                     + "\(error.localizedDescription) Nothing was moved.")
             }
         }
@@ -296,11 +576,10 @@ final class Library: ObservableObject {
     @discardableResult
     func trash(_ pdfURL: URL) throws -> [UndoLog.TrashedFile] {
         let manager = FileManager.default
-        let sidecar = pdfURL.deletingPathExtension()
-            .appendingPathExtension(AnkiIdentity.sidecarExtension)
         var moved: [UndoLog.TrashedFile] = []
         do {
-            for url in [pdfURL, sidecar] where manager.fileExists(atPath: url.path) {
+            for url in [pdfURL] + AnkiIdentity.companions(of: pdfURL)
+            where manager.fileExists(atPath: url.path) {
                 var destination: NSURL?
                 try manager.trashItem(at: url, resultingItemURL: &destination)
                 if let destination = destination as URL? {
@@ -392,11 +671,11 @@ final class Library: ObservableObject {
 
     @discardableResult
     func createFolder(named name: String, in parent: URL) throws -> URL {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines).asPOSIXName
         guard !trimmed.isEmpty else { throw FileError.failed("A folder needs a name.") }
         let target = parent.appendingPathComponent(trimmed, isDirectory: true)
         guard !FileManager.default.fileExists(atPath: target.path) else {
-            throw FileError.exists(trimmed)
+            throw FileError.exists(trimmed.asFinderName)
         }
         do {
             try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
@@ -479,16 +758,29 @@ final class Library: ObservableObject {
     }
 
 
-    /// Deck name for a lecture: `AnkiFlow::<folders>::<pdf name>`.
-    /// Folder structure is the deck structure.
+    /// Deck name for a lecture: `AnkiFlow::<library>::<folders>::<pdf name>`.
+    ///
+    /// The root is the father, the library folder is its child, and the folders
+    /// inside the library are the grandchildren -- so the shape of your decks in
+    /// Anki is the shape of your folders on disk, with one name above them that
+    /// says where they came from. The library's own name is taken from the
+    /// folder rather than stored anywhere, which is what lets the app keep
+    /// nothing per library at all.
     func deckName(for pdfURL: URL) -> String {
-        var components: [String] = [settings.resolvedDeckRoot]
+        var components: [String] = []
+        let deckRoot = settings.resolvedDeckRoot
+        if !deckRoot.isEmpty { components.append(deckRoot) }
+        components.append(name)
         let rootParts = root.standardizedFileURL.pathComponents
         let pdfParts = pdfURL.standardizedFileURL.deletingLastPathComponent().pathComponents
         if pdfParts.count > rootParts.count {
-            components.append(contentsOf: pdfParts[rootParts.count...])
+            // Path components, so the Finder's spelling has to be put back the
+            // same way it is for the lecture itself: a folder you called
+            // "Block 1/2" is stored as "Block 1:2", and the deck should carry
+            // the name you gave it.
+            components.append(contentsOf: pdfParts[rootParts.count...].map(\.asFinderName))
         }
-        components.append(pdfURL.deletingPathExtension().lastPathComponent)
+        components.append(pdfURL.lectureName)
         // "::" separates deck levels in Anki, so it cannot appear inside a name.
         return components.map { $0.replacingOccurrences(of: "::", with: "-") }
                          .joined(separator: "::")
@@ -510,14 +802,6 @@ final class Library: ObservableObject {
         }
         walk(tree)
         return out
-    }
-
-    private func saveSettings() {
-        let url = LibraryPaths.settingsURL(inLibrary: root)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(settings) else { return }
-        try? AtomicWrite.write(data, to: url)
     }
 
     private static func scan(directory: URL) -> [LibraryNode] {

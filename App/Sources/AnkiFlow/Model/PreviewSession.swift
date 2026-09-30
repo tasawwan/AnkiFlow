@@ -17,7 +17,7 @@ final class PreviewSession: ObservableObject {
     struct Item: Identifiable {
         let id: String
         let question: Question
-        let mask: Mask?
+        let masks: [Mask]
         let lecture: String
         let pdfURL: URL
         /// 1 of 6, for a question that makes six cards.
@@ -35,7 +35,7 @@ final class PreviewSession: ObservableObject {
     private var documents: [URL: (document: PDFDocument, sha: String)] = [:]
     private var images: [CardComposition.ImageSpec: NSImage] = [:]
 
-    init(settings: LibrarySettings, cacheDirectory: URL) {
+    init(settings: AppSettings, cacheDirectory: URL) {
         self.renderer = PageRenderer(cacheDirectory: cacheDirectory, settings: settings)
     }
 
@@ -66,7 +66,7 @@ final class PreviewSession: ObservableObject {
                 .appendingPathExtension(AnkiIdentity.sidecarExtension)
             guard let data = try? Data(contentsOf: sidecar),
                   let file = try? decoder.decode(SidecarFile.self, from: data) else { continue }
-            let lecture = pdfURL.deletingPathExtension().lastPathComponent
+            let lecture = pdfURL.lectureName
 
             for question in file.questions where !question.isEmpty {
                 // Cloze is the one kind that makes several cards from one note
@@ -78,7 +78,7 @@ final class PreviewSession: ObservableObject {
                         built.append(Item(
                             id: "\(question.qid)#c\(ordinal)",
                             question: question,
-                            mask: nil,
+                            masks: [],
                             lecture: lecture,
                             pdfURL: pdfURL,
                             ordinal: ordinals.count > 1 ? offset + 1 : nil,
@@ -94,7 +94,7 @@ final class PreviewSession: ObservableObject {
                     built.append(Item(
                         id: question.guid(variant: variant.variant),
                         question: question,
-                        mask: variant.mask,
+                        masks: variant.masks,
                         lecture: lecture,
                         pdfURL: pdfURL,
                         ordinal: variants.count > 1 ? offset + 1 : nil,
@@ -135,7 +135,7 @@ final class PreviewSession: ObservableObject {
     // MARK: - Drawing
 
     func composition(for item: Item) -> (front: [CardComposition.ImageSpec], back: [CardComposition.ImageSpec]) {
-        CardComposition.images(for: item.question, mask: item.mask)
+        CardComposition.images(for: item.question, masks: item.masks)
     }
 
     /// Renders through the shared cache. Slow the first time a slide is seen,

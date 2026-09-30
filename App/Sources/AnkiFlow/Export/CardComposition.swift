@@ -15,9 +15,15 @@ enum CardComposition {
 
     /// `mask` is the region a separate-mode occlusion card is asking about, and
     /// nil for everything else.
-    static func images(for question: Question, mask: Mask?) -> (front: [ImageSpec], back: [ImageSpec]) {
+    static func images(for question: Question, masks group: [Mask]) -> (front: [ImageSpec], back: [ImageSpec]) {
         if question.kind == .occlusion, let page = question.occlusionPage {
             let crop = question.answerCrops[page] ?? question.questionCrops[page]
+            let ids = Set(group.map(\.id))
+            // A card whose group is every region is the old all-at-once: there
+            // is no single thing it asks about, so everything is simply hidden
+            // rather than picked out. Keeping that shape means those cards
+            // render the same picture, under the same filename, as before.
+            let isEverything = !group.isEmpty && ids.count == question.masks.count
             // Front: everything hidden, with the region this card asks about in
             // the accent colour. Back: everything visible, with the regions that
             // were covered boxed.
@@ -26,13 +32,16 @@ enum CardComposition {
             // boxes all of them. Without that the answer is just the bare slide,
             // and you are left comparing it against the front from memory to
             // work out which parts you were meant to have recalled.
-            let front = PageRenderer.MaskPaint(
-                hidden: question.masks.filter { $0.id != mask?.id }.map(\.rect),
-                target: mask?.rect,
-                outlined: []
-            )
-            let revealed = mask.map { [$0.rect] } ?? question.masks.map(\.rect)
-            let back = PageRenderer.MaskPaint(hidden: [], target: nil, outlined: revealed)
+            let front = isEverything
+                ? PageRenderer.MaskPaint(hidden: question.masks.map(\.rect),
+                                         targets: [], outlined: [])
+                : PageRenderer.MaskPaint(
+                    hidden: question.masks.filter { !ids.contains($0.id) }.map(\.rect),
+                    targets: group.map(\.rect),
+                    outlined: []
+                )
+            let revealed = group.isEmpty ? question.masks.map(\.rect) : group.map(\.rect)
+            let back = PageRenderer.MaskPaint(hidden: [], targets: [], outlined: revealed)
             return (
                 [ImageSpec(page: page, crop: crop, masks: front)],
                 [ImageSpec(page: page, crop: crop, masks: back)]

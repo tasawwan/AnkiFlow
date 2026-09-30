@@ -102,6 +102,72 @@ enum Cloze {
         }
     }
 
+    /// The markup for a deletion, at whatever card number you ask for.
+    static func markup(_ deletion: Deletion, ordinal: Int) -> String {
+        if let hint = deletion.hint, !hint.isEmpty {
+            return "{{c\(ordinal)::\(deletion.answer)::\(hint)}}"
+        }
+        return "{{c\(ordinal)::\(deletion.answer)}}"
+    }
+
+    /// Move one deletion onto a different card. The index is its position in
+    /// `deletions(in:)` -- reading order, which is the order the panel lists
+    /// them in, and the only handle a deletion has: two deletions can share an
+    /// ordinal and two can hide the same words.
+    static func renumber(_ text: String, deletionAt index: Int, to ordinal: Int) -> String {
+        rewriteIndexed(text) { position, deletion in
+            markup(deletion, ordinal: position == index ? ordinal : deletion.ordinal)
+        }
+    }
+
+    /// Stop hiding one phrase, leaving the words where they are.
+    static func unwrap(_ text: String, deletionAt index: Int) -> String {
+        rewriteIndexed(text) { position, deletion in
+            position == index ? deletion.answer : markup(deletion, ordinal: deletion.ordinal)
+        }
+    }
+
+    /// One card each, or all of them on one.
+    static func regrouped(_ text: String, separate: Bool) -> String {
+        var next = 0
+        return rewriteIndexed(text) { _, deletion in
+            if separate {
+                next += 1
+                return markup(deletion, ordinal: next)
+            }
+            return markup(deletion, ordinal: 1)
+        }
+    }
+
+    /// Close the gaps so the numbers read 1, 2, 3 rather than 1, 3, 7.
+    ///
+    /// Cosmetic to Anki, which only cares that ordinals differ -- but the panel
+    /// lists them by number, and "Card 7" of three cards is a puzzle.
+    static func compacted(_ text: String) -> String {
+        var map: [Int: Int] = [:]
+        for (index, ordinal) in ordinals(in: text).enumerated() { map[ordinal] = index + 1 }
+        return rewriteIndexed(text) { _, deletion in
+            markup(deletion, ordinal: map[deletion.ordinal] ?? deletion.ordinal)
+        }
+    }
+
+    /// Rebuilds the string with each deletion replaced by whatever `body`
+    /// returns, told which one it is.
+    private static func rewriteIndexed(_ text: String, body: (Int, Deletion) -> String) -> String {
+        let found = deletions(in: text)
+        guard !found.isEmpty else { return text }
+        var out = ""
+        var cursor = text.startIndex
+        for (index, deletion) in found.enumerated() {
+            guard deletion.range.lowerBound >= cursor else { continue }
+            out += text[cursor..<deletion.range.lowerBound]
+            out += body(index, deletion)
+            cursor = deletion.range.upperBound
+        }
+        out += text[cursor...]
+        return out
+    }
+
     /// Rebuilds the string with each deletion replaced by whatever `body`
     /// returns. Walks the matches in order and copies the gaps between them, so
     /// the untouched text is preserved byte for byte.

@@ -14,5 +14,6 @@ struct TemplateEditorWindow: View {
             // Re-seed the editor's local state when a different template is
             // chosen while the window is already open.
             .id(state.editingTemplate?.id ?? "new-template")
+            .frame(minWidth: 720, minHeight: 560)
     }
 }

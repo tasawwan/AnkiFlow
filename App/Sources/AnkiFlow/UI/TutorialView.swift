@@ -78,12 +78,11 @@ struct TutorialView: View {
                     """)
 
                     section("The card types", """
-                    **Basic** — your typed question on the front, the attached slides on the back.
-
-                    **Slide2Slide** — slides are the question. Optional text on the front lets you \
-                    ask something specific about them ("which step here is rate-limiting?"), then \
-                    other slides answer it. Click either slide row to arm it; the armed row is the \
-                    one ⌘E and ⌘T act on.
+                    **Basic** — your question, its slides, the answer, its slides. All four \
+                    optional, and this is most cards. Putting slides on the question side makes \
+                    the slides the question ("which step here is rate-limiting?"), which is what \
+                    the old Slide2Slide type was for; it is gone, because a Basic card already \
+                    does it. Questions saved under the old type open as Basic, unchanged.
 
                     **Cloze** — a sentence with pieces blanked out. Type the line, select the part \
                     you want hidden, and press ⇧⌘C. Each blank becomes its own card with its own \
@@ -128,7 +127,7 @@ struct TutorialView: View {
                     section("Cropping a slide", """
                     Hold ⌥ and drag on the page to keep just part of a slide — one figure out of \
                     a busy layout. Everything outside the rectangle dims while you drag; let go \
-                    and it's set. ⌘U undoes it while it is still the last thing you did; after that, the crop badge on the slide row lists every cropped slide so you can remove any one of them.
+                    and it's set. ⌘Z undoes it while it is still the last thing you did; after that, the crop badge on the slide row lists every cropped slide so you can remove any one of them.
 
                     The crop belongs to whichever slide row is armed, so the same page can be \
                     cropped one way on a card's front and another on its back. Cropped slides are \
@@ -150,7 +149,7 @@ struct TutorialView: View {
 
                     **Nothing is written until you say so.** Marks appear as you make them and \
                     live in memory until you press ⌘S, or the Save button that turns up the \
-                    moment there is something to save. ⌘U takes back the last mark and ⇧⌘U puts \
+                    moment there is something to save. ⌘Z takes back the last mark and ⇧⌘Z puts \
                     it back, the same keys as everywhere else. Leaving with unsaved marks asks first.
 
                     Select text and click Highlight, Underline or Strikethrough. For anything that \
@@ -184,6 +183,34 @@ struct TutorialView: View {
                 // Grouped only to stay under the ten-child limit a
                 // ViewBuilder imposes. No effect on layout.
                 Group {
+                    section("Notes", """
+                    Cards are for details. Notes are for the shape of the thing — what the \
+                    lecture was actually about, the bit that finally made sense.
+
+                    The notes pane is at the bottom of the right panel; ⌘4 hides and shows it, \
+                    and the divider drags. It is an ordinary rich text editor: bold (⌘B), \
+                    italic (⌘I), underline (⌘U), strikethrough (⇧⌘X), a link (⌘K), headings and \
+                    bullets. Those keys mean that only while you are typing in a note; ⌘Z \
+                    undoes there, the same as everywhere else. Press a button with nothing \
+                    selected and the next thing you type comes out in that style.
+
+                    No colour well and no font picker, on purpose — Markdown cannot record \
+                    either, so those buttons would style the text on screen and lose it on save. \
+                    Bigger text is a heading.
+
+                    Each note is a plain .md file beside the PDF, named after it — Innate \
+                    Immunity.pdf gets Innate Immunity Notes.md — in real \
+                    Markdown, the kind you would have typed yourself. It \
+                    follows the lecture: rename or move the PDF and the note goes with it, delete \
+                    the lecture and the note goes to the Trash too, and if the pair is ever \
+                    separated, recovery brings both back.
+
+                    The file is the truth. Empty the note and the .md is removed rather than left \
+                    behind blank; edit it in another app and the pane picks the change up within a \
+                    couple of seconds; delete it in Finder and the pane empties to match and says \
+                    so.
+                    """)
+
                     section("Finding a slide", """
                     ⌘F searches the lecture you have open and jumps to the hit. ⌘G goes to the \
                     next one, and it wraps around. ⎋ closes the bar.
@@ -254,12 +281,12 @@ struct TutorialView: View {
                     PDF as a readable JSON file, and a lecture with no questions gets no file at all.
 
                     The app autosaves — there's no save dialog and no unsaved state. ⌘⏎ finishes \
-                    a question and folds it shut; ⌘U undoes and ⇧⌘U redoes, and that history \
+                    a question and folds it shut; ⌘Z undoes and ⇧⌘Z redoes, and that history \
                     survives quitting. Question files are hidden in Finder by default; ⇧⌘. shows \
                     them.
 
                     **Rename and move lectures from the sidebar**, not in Finder — drag a lecture \
-                    onto a folder to move it, and right-click for Rename or Move to Trash — ⌘U puts a trashed lecture back. Done here, your \
+                    onto a folder to move it, and right-click for Rename or Move to Trash — ⌘Z puts a trashed lecture back. Done here, your \
                     questions travel with the PDF. Done in Finder they get left behind, and the app \
                     has to notice and offer to put them back.
 
@@ -384,7 +411,7 @@ enum Shortcuts {
         ("⌘T",  "Toggle this page in or out"),
         ("⌘R",  "Re-anchor: start a new range here"),
         ("⌥-drag", "Crop the slide you're pointing at"),
-        ("⌘U  ⇧⌘U", "Undo and redo — questions, or PDF marks while editing"),
+        ("⌘Z  ⇧⌘Z", "Undo and redo — questions, PDF marks, or typing in a note"),
         ("⌘S",  "Save your marks into the PDF (while editing)"),
         ("⌘F ⌘G", "Find slides in this lecture, and the next hit"),
         ("⇧⌘F", "Find slides across the library"),
@@ -396,7 +423,7 @@ enum Shortcuts {
         ("⌘P",  "Preview your cards"),
         ("⌘D",  "Export deck"),
         ("⌘O",  "Open library"),
-        ("⌘1 ⌘2", "Sidebar / slide gallery"),
+        ("⌘1 ⌘2 ⌘4", "Sidebar / slide gallery / notes"),
         ("⌘,",  "Settings")
     ]
 }
