@@ -103,9 +103,22 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
     private var textEditor: NSTextView?
     private var editingAnnotation: PDFAnnotation?
     private var editingIsNew = false
+    /// The zoom the editor was opened at.
+    ///
+    /// The box's font lives in page points and the editor shows it in view
+    /// points, which is that times the zoom. Mixing the two is how a box typed
+    /// at 140% came out half again too big the moment you clicked away, and why
+    /// the words stayed one size while the box grew as you zoomed.
+    private var editingScale: CGFloat = 1
 
     private var observing = false
     private let minimumDrag: CGFloat = 5
+    /// How far the pointer has to travel before a press on a mark is a drag.
+    ///
+    /// No click is perfectly still. Taking the first pixel of wobble as a drag
+    /// nudged a mark every time you selected one -- and put an undo step on the
+    /// stack for it, so the way back from selecting something was Cmd-Z.
+    private let dragSlop: CGFloat = 3
     /// The grip as it is drawn.
     private let handleSize: CGFloat = 7
     /// The grip as it is aimed at. A 7-point square is accurate to hit with a
@@ -380,7 +393,11 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
         }
         if range.length == 0, let annotation = editingAnnotation,
            let font = editor.textStorage?.attribute(.font, at: 0, effectiveRange: nil) as? NSFont {
-            annotation.font = font
+            // The editor's font is in view points; the annotation's is in page
+            // points. Copying one into the other without the zoom is how bolding
+            // a box at 140% also made it half again larger.
+            let size = max(1, font.pointSize / editingScale)
+            annotation.font = NSFont(descriptor: font.fontDescriptor, size: size)
         }
         editor.didChangeText()
         editor.setSelectedRange(range)
@@ -499,6 +516,9 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
                 commitTextEditing()
                 window.makeFirstResponder(self)
                 beginSelectDrag(at: point, on: page, clickCount: event.clickCount)
+                // A double-click opened the box for typing. Tracking the rest of
+                // that click would drag the thing you are now inside.
+                if textEditor != nil { return }
                 // beginSelectDrag always picks something up here, so proceed to drag tracking
             } else {
                 // Click on empty space: deselect any annotation and pass through to PDFKit.
@@ -515,6 +535,7 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
                 commitTextEditing()
                 window.makeFirstResponder(self)
                 beginSelectDrag(at: point, on: page, clickCount: event.clickCount)
+                if textEditor != nil { return }
             } else {
                 commitTextEditing()
                 window.makeFirstResponder(self)
@@ -561,7 +582,8 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
             else { break tracking }
             last = next
             let here = convert(next.locationInWindow, from: nil)
-            if here != dragEnd { dragMoved = true }
+            if !dragMoved, let from = dragStart,
+               hypot(here.x - from.x, here.y - from.y) >= dragSlop { dragMoved = true }
             dragEnd = here
             if tool.drawsStroke || tool == .lasso { strokePoints.append(here) }
             if tool == .eraser { markForErasing(at: here) }
@@ -580,6 +602,22 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
     private func beginSelectDrag(at point: NSPoint, on page: PDFPage, clickCount: Int) {
         guard let session else { return }
         let inPage = toPage(point, page)
+
+        // A double-click opens the box you are pointing at, whatever grip it
+        // lands in. The grab area round a grip is deliberately wider than the
+        // grip is drawn, and on a box two lines tall those areas meet in the
+        // middle -- so the click meant to put the caret in started a resize
+        // instead, and the only way into the box was to aim at its exact centre.
+        if clickCount >= 2, let hit = PDFEditing.mark(at: inPage, on: page),
+           PDFEditing.kind(of: hit) == "FreeText" {
+            let selection = PDFEditSession.Selection(annotation: hit, page: page)
+            session.selection = selection
+            session.selections = [selection]
+            beginTextEditing(hit, on: page, isNew: false)
+            dragKind = .create
+            needsDisplay = true
+            return
+        }
 
         if session.selections.count > 1,
            let group = selectionFrame(session.selections, on: page),
@@ -629,11 +667,12 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
             return
         }
 
-        // One line of a marked sentence means the whole sentence.
-        if let group = PDFEditing.markGroup(of: hit) {
-            let family = page.annotations
-                .filter { PDFEditing.markGroup(of: $0) == group }
-                .map { PDFEditSession.Selection(annotation: $0, page: page) }
+        // One line of a marked passage means the whole passage -- whoever made
+        // it. `family` decides what belongs together; everything else is picked
+        // up on its own.
+        let family = PDFEditing.family(of: hit, on: page)
+            .map { PDFEditSession.Selection(annotation: $0, page: page) }
+        if family.count > 1 {
             session.selection = PDFEditSession.Selection(annotation: hit, page: page)
             session.selections = family
             dragKind = .pinned
@@ -644,12 +683,21 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
         if session.selection?.annotation !== hit {
             session.selection = PDFEditSession.Selection(annotation: hit, page: page)
         }
-        if clickCount >= 2, PDFEditing.kind(of: hit) == "FreeText" {
-            beginTextEditing(hit, on: page, isNew: false)
-            dragKind = .create
-            dragPage = nil
+        // A page of flattened iPad markup is selectable so it can be deleted,
+        // and fixed where it is. Dragging it would slide a picture of your
+        // handwriting off the words it was written on.
+        if PDFEditing.isFlattenedMarkup(hit) {
+            session.selections = [PDFEditSession.Selection(annotation: hit, page: page)]
+            dragKind = .pinned
+            needsDisplay = true
             return
         }
+        // Always, not only when the selection changed. Leaving the old list in
+        // place is what made a click on one mark look like a selection of
+        // everything: `selections` outranks `selection` wherever both are read,
+        // so a stale set from an earlier lasso or passage went on being drawn,
+        // dragged and deleted long after you had clicked away from it.
+        session.selections = [PDFEditSession.Selection(annotation: hit, page: page)]
         dragKind = .move
         dragOriginalFrame = PDFEditing.frame(of: hit)
         dragOriginalPaths = PDFEditing.isSketch(hit) ? (hit.paths ?? []) : []
@@ -728,6 +776,14 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
         guard exactPage(at: end) === page else { return }
         let from = toPage(start, page)
         let to = toPage(end, page)
+
+        // Below the slop nothing has happened yet, so nothing moves. Without
+        // this the mark followed the wobble live and only the recording was
+        // held back, which looked exactly like a nudge that would not undo.
+        switch dragKind {
+        case .move, .resize: guard dragMoved else { return }
+        default: break
+        }
 
         switch dragKind {
         case .pinned:
@@ -1198,7 +1254,7 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
             }
             let selected = page.annotations.compactMap { annotation -> PDFEditSession.Selection? in
                 let kind = PDFEditing.kind(of: annotation)
-                guard !PDFEditing.isFlag(annotation),
+                guard PDFEditing.isSelectable(annotation),
                       kind != "Highlight", kind != "Underline", kind != "StrikeOut",
                       PDFEditing.frame(of: annotation).intersects(pageSelection) else { return nil }
                 return PDFEditSession.Selection(annotation: annotation, page: page)
@@ -1306,15 +1362,17 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
         guard let pdfView else { return }
         editingAnnotation = annotation
         editingIsNew = isNew
+        editingScale = max(0.05, pdfView.scaleFactor)
 
         let editor = NSTextView(frame: toView(annotation.bounds, page))
         if let richText = PDFEditing.richText(for: annotation) {
-            editor.textStorage?.setAttributedString(richText)
+            editor.textStorage?.setAttributedString(
+                PDFEditing.rescaled(richText, by: editingScale))
         } else {
             editor.string = annotation.contents ?? ""
         }
         if PDFEditing.richText(for: annotation) == nil {
-            editor.font = currentFont(size: fontSize * pdfView.scaleFactor)
+            editor.font = currentFont(size: fontSize * editingScale)
             editor.textColor = annotation.fontColor ?? strokeColour
         }
         editor.backgroundColor = NSColor.textBackgroundColor.withAlphaComponent(0.92)
@@ -1341,6 +1399,20 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
         guard let textEditor, let annotation = editingAnnotation,
               let page = annotation.page else { return }
         textEditor.frame = toView(annotation.bounds, page)
+        // And the words with it. Moving the frame alone left a box you had
+        // zoomed into holding text at the size of the zoom you opened it at.
+        let scale = max(0.05, pdfView?.scaleFactor ?? 1)
+        guard abs(scale - editingScale) > 0.001 else { return }
+        let factor = scale / editingScale
+        let caret = textEditor.selectedRange()
+        textEditor.textStorage?.setAttributedString(
+            PDFEditing.rescaled(textEditor.attributedString(), by: factor))
+        textEditor.setSelectedRange(caret)
+        if let font = textEditor.font {
+            let size = max(1, font.pointSize * factor)
+            textEditor.font = NSFont(descriptor: font.fontDescriptor, size: size)
+        }
+        editingScale = scale
     }
 
     /// Write the words back through the undo stack and put the editor away.
@@ -1351,7 +1423,9 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
         // in edit mode, with its text lost.
         guard let editor = textEditor, let annotation = editingAnnotation else { return }
         let text = editor.string
-        let attributedText = editor.attributedString()
+        // Back to page points, the units the annotation and the file keep.
+        let attributedText = PDFEditing.rescaled(editor.attributedString(),
+                                                 by: 1 / editingScale)
         // `attribute(at:)` on an empty attributed string raises -- there is no
         // character 0 to ask about. Committing an empty box is the ordinary
         // case, not an edge one: drawing a text box and then clicking Save,
@@ -1376,6 +1450,7 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
         textEditor = nil
         editingAnnotation = nil
         editingIsNew = false
+        editingScale = 1
         editor.removeFromSuperview()
 
         guard let session else { refresh(); return }
@@ -1432,6 +1507,9 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
             where PDFEditing.kind(of: annotation) == "FreeText" &&
                   annotation.shouldDisplay == false {
                 guard let text = annotation.contents, !text.isEmpty else { continue }
+                // The editor is sitting on top of this one with the live text in
+                // it; drawing the old words underneath shows through it.
+                if annotation === editingAnnotation { continue }
                 let rect = toView(annotation.bounds, page).insetBy(dx: 2, dy: 2)
                 if let fill = annotation.interiorColor {
                     fill.setFill()
@@ -1442,7 +1520,9 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
                         .font: annotation.font ?? NSFont.systemFont(ofSize: 14),
                         .foregroundColor: annotation.fontColor ?? NSColor.labelColor
                     ])
-                attributed.draw(in: rect)
+                // Page points up to the zoom, so the words grow with the box
+                // they are in rather than staying the size they were typed at.
+                PDFEditing.rescaled(attributed, by: pdfView.scaleFactor).draw(in: rect)
             }
         }
     }
@@ -1509,11 +1589,37 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
            let frame = selectionFrame(session.selections, on: page) {
             drawSelectionFrame(frame, page: page)
         } else if let selection = session.selection {
-            drawSelectionFrame(PDFEditing.frame(of: selection.annotation), page: selection.page)
+            // A text mark is drawn around its rows, not around the box that
+            // contains them.
+            //
+            // One Preview highlight covering a paragraph has a `/Rect` that
+            // spans every line of it, blank space and all -- and whatever else
+            // happens to sit inside that rectangle, which on a slide with
+            // handwriting under the text is most of the slide. Outlining the
+            // rect made one mark look like a selection of everything on the
+            // page. The rows are what is selected, so the rows are what is
+            // shown.
+            let rows = PDFEditing.quads(of: selection.annotation)
+            if rows.count > 1 {
+                for row in rows {
+                    drawSelectionFrame(row, page: selection.page, resizable: false)
+                }
+            } else {
+                drawSelectionFrame(PDFEditing.frame(of: selection.annotation),
+                                   page: selection.page,
+                                   resizable: PDFEditing.isResizable(selection.annotation))
+            }
         }
     }
 
-    private func drawSelectionFrame(_ pageFrame: CGRect, page: PDFPage) {
+    /// `resizable` false draws the outline and no grips.
+    ///
+    /// A highlight has no size of its own to set -- it is the words it covers,
+    /// and `isResizable` has always said so, so the grips were drawn over
+    /// something that would not move when you pulled them. The outline stays:
+    /// you still need to see what is selected in order to delete it.
+    private func drawSelectionFrame(_ pageFrame: CGRect, page: PDFPage,
+                                    resizable: Bool = true) {
         let frame = toView(pageFrame, page)
 
         NSColor.controlAccentColor.withAlphaComponent(0.14).setFill()
@@ -1524,6 +1630,7 @@ final class PDFEditOverlayView: NSView, NSTextViewDelegate {
         outline.setLineDash([4, 3], count: 2, phase: 0)
         outline.stroke()
 
+        guard resizable else { return }
         let handles: [Handle] = (session?.selections.count ?? 0) > 1
             ? [.bottomRight] : Handle.allCases
         for handle in handles {

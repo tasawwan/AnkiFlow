@@ -144,6 +144,9 @@ struct AnkiFlowApp: App {
             Button("Re-file Clinical Topics") { state.reclassifyClinicalTopics() }
                 .disabled(state.library == nil)
 
+            Button("Tidy Half-Typed Topics") { state.tidyTypedTopics() }
+                .disabled(state.library == nil)
+
             Divider()
 
             Button("Export Deck…") {
@@ -214,6 +217,22 @@ struct AnkiFlowApp: App {
         // styling was never the point -- text copied out of a PDF arrives
         // wrapped at the slide's line width, and it is those line breaks you
         // want gone. See PasteCleaner.
+        // Cut, Paste and Select All are forwarded untouched -- they are here
+        // only because replacing the group removes all of them, and a text field
+        // without ⌘X and ⌘V is worse than a beep on ⌘C.
+        CommandGroup(replacing: .pasteboard) {
+            Button("Cut") { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil) }
+                .keyboardShortcut("x", modifiers: .command)
+            Button("Copy") { state.copySelection() }
+                .keyboardShortcut("c", modifiers: .command)
+            Button("Paste") { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil) }
+                .keyboardShortcut("v", modifiers: .command)
+            Button("Select All") {
+                NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+            }
+            .keyboardShortcut("a", modifiers: .command)
+        }
+
         CommandGroup(after: .pasteboard) {
             Button("Paste Without Formatting") { PasteCleaner.pasteReflowed() }
                 .keyboardShortcut("v", modifiers: [.command, .shift])
@@ -365,6 +384,18 @@ struct AnkiFlowApp: App {
             Button("Save Marks into PDF") { state.savePDFEdits() }
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(!state.hasUnsavedPDFEdits)
+
+            // Above the divider, with the two things that work *outside* edit
+            // mode. Everything below it needs the markup bar up.
+            //
+            // ⇧⌘H rather than ⌘H: macOS hands every app ⌘H for Hide, and an app
+            // that takes it back either loses the race or hides itself when you
+            // meant to mark a sentence.
+            Button(state.selectionIsHighlighted ? "Remove Highlight" : "Highlight Selection") {
+                state.toggleHighlightSelection()
+            }
+            .keyboardShortcut("h", modifiers: [.command, .shift])
+            .disabled(!state.hasTextSelection || !state.canEditPDF)
 
             Divider()
 

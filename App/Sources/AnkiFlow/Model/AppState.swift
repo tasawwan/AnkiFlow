@@ -78,6 +78,9 @@ final class AppState: ObservableObject {
             // because deleting here would change the document from inside this
             // property's own publish.
             guard let abandoned = oldValue, abandoned != focusedQID else { return }
+            // The draft belonged to the card you just left. Keeping it would
+            // show one card's answers in another card's boxes.
+            blankDraft = nil
             Task { @MainActor [weak self] in self?.discard(ifEmpty: abandoned) }
         }
     }
@@ -356,6 +359,7 @@ final class AppState: ObservableObject {
         // per character typed. The notes views observe it directly instead; the
         // only thing the rest of the app needs to know is that a different note
         // is open, which `notes` being @Published already says.
+        forgetPDFMarks()
         notes = LectureNotes(pdfURL: url, textColour: .labelColor)
         // Old-scheme template questions become ordinary cards carrying their
         // own words, once, here.
@@ -584,11 +588,19 @@ final class AppState: ObservableObject {
         if let hint = question.viewTemplateId,
            let template = templates.template(id: hint),
            template.enabled, template.kind == question.kind,
-           question.hasNoText
+           question.hasNoText || question.qid == focusedQID
             || template.recover(front: question.front, back: question.back) != nil {
             return .template(hint)
         }
-        if let match = matchedTemplateId(for: question) { return .template(match) }
+        // Not while you are writing it. A Basic card whose wording happens to
+        // reach a template's shape used to change tab on the keystroke that
+        // completed the sentence -- the card you were typing in vanished from
+        // the list in front of you and reopened somewhere else, with its fields
+        // rearranged into that shape's blanks mid-sentence. The claim is still
+        // made, but it waits until you are done with the card: see
+        // `adoptTemplate`.
+        if question.qid != focusedQID,
+           let match = matchedTemplateId(for: question) { return .template(match) }
         switch question.kind {
         case .occlusion:        return .occlusion
         case .cloze:            return .cloze
@@ -601,10 +613,30 @@ final class AppState: ObservableObject {
         templates.template(id: tab(for: question).templateId)
     }
 
+    /// What you have typed into the open card's blanks, while you are typing.
+    ///
+    /// A template is a lens: the card holds only its finished words, and the
+    /// blanks are read back out of them. That reading is exact once the card is
+    /// written, and genuinely ambiguous while it is half written -- two
+    /// free-text blanks with a blank line between them and nothing in the first
+    /// one leave text that reads equally well as either. So a cause typed into
+    /// the Cause box came back on the next keystroke as the Presentation.
+    ///
+    /// While a card is open its blanks are remembered here instead. The text is
+    /// still the only thing saved, and the only thing exported; this is a note
+    /// of which box each piece of it came from, kept for exactly as long as you
+    /// are in the card and thrown away when you leave it.
+    private var blankDraft: (qid: String, values: [String: String])?
+
+    func forgetBlankDraft() { blankDraft = nil }
+
     /// What was typed into each of a template's blanks, read back out of the
-    /// finished text. Empty for a question that has nothing in it yet.
+    /// finished text -- or, for the card you are in, what you actually typed.
     func blankValues(for question: Question, template: Template) -> [String: String] {
-        template.recover(front: question.front, back: question.back) ?? [:]
+        if let draft = blankDraft, draft.qid == question.qid, focusedQID == question.qid {
+            return draft.values
+        }
+        return template.recover(front: question.front, back: question.back) ?? [:]
     }
 
     /// Type into one blank of a template. The card's own text is what changes --
@@ -617,8 +649,11 @@ final class AppState: ObservableObject {
         guard question.hasNoText
                 || template.recover(front: question.front, back: question.back) != nil
         else { return }
-        var values = template.recover(front: question.front, back: question.back) ?? [:]
+        var values = blankValues(for: question, template: template)
         values[key] = value
+        // Remembered before the card is re-rendered, so the next keystroke
+        // reads this rather than re-deriving it from text that cannot say.
+        blankDraft = (qid, values)
         let on = template.selectedOptions(inFront: question.front)
         let rendered = template.render(blanks: values, options: on)
         question.front = rendered.front
@@ -627,7 +662,6 @@ final class AppState: ObservableObject {
         question.viewTemplateId = template.id
         question.updatedAt = Date()
         document.update(question)
-        fileTopics(from: values, template: template)
     }
 
     /// Ticks or unticks one of a shape's optional questions on a card.
@@ -641,7 +675,7 @@ final class AppState: ObservableObject {
         guard let document, var question = document.question(qid: qid) else { return }
         var selected = template.selectedOptions(inFront: question.front)
         guard selected.contains(key) != on else { return }
-        let values = template.recover(front: question.front, back: question.back) ?? [:]
+        let values = blankValues(for: question, template: template)
         snapshot(on ? "asking that too" : "dropping that question")
         if on { selected.insert(key) } else { selected.remove(key) }
         let rendered = template.render(blanks: values, options: selected)
@@ -651,12 +685,6 @@ final class AppState: ObservableObject {
         question.updatedAt = Date()
         document.update(question)
     }
-
-    /// Which blank of a clinical shape belongs in which section of the topics
-    /// panel. A disease is a diagnosis, so it is Dx -- not a concept.
-    static let clinicalTopicRoutes: [(key: String, type: String)] = [
-        ("disease", "Dx"), ("tx", "Tx"), ("rx", "Rx")
-    ]
 
     /// Puts every clinical topic already in the library under the right heading.
     ///
@@ -698,11 +726,14 @@ final class AppState: ObservableObject {
                       let values = template.recover(front: question.front,
                                                     back: question.back)
                 else { continue }
-                for route in Self.clinicalTopicRoutes {
-                    let name = (values[route.key] ?? "")
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard name.count > 2, name.count < 80 else { continue }
-                    wanted[name] = route.type
+                let on = template.selectedOptions(inFront: question.front)
+                for blank in template.blanks(options: on) {
+                    guard let type = blank.filesUnder else { continue }
+                    for line in (values[blank.key] ?? "").components(separatedBy: .newlines) {
+                        let name = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard name.count > 2, name.count < 80 else { continue }
+                        wanted[name] = type
+                    }
                 }
             }
             guard !wanted.isEmpty else { continue }
@@ -729,20 +760,92 @@ final class AppState: ObservableObject {
         return moved
     }
 
-    /// Disease, Tx and Rx become topics as you type them.
+    /// Clears out the half-typed topics an earlier version of this app filed on
+    /// every keystroke.
     ///
-    /// Only ones that are not already there, and always at Low: re-editing a
-    /// card must not duplicate a topic or push a rating you have since raised
-    /// back down.
-    private func fileTopics(from values: [String: String], template: Template) {
-        guard let notes else { return }
-        let routes = Self.clinicalTopicRoutes
-        for route in routes {
-            let name = (values[route.key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard name.count > 2, name.count < 80,
-                  !notes.topics.contains(where: { $0.id == name.lowercased() }) else { continue }
-            notes.addTopic(name, type: route.type)
+    /// It used to add a topic as you typed the Disease box, so one disease left
+    /// a ladder behind it: "Pyruvate kinase def", "…defi", "…defic", up to the
+    /// real one. The ladder is what identifies it -- three or more topics in one
+    /// section where each is the start of the next -- and only the longest is
+    /// kept.
+    ///
+    /// Three, not two, because two is an ordinary pair of topics: "Insulin" and
+    /// "Insulin resistance" are both things to know, and a rule that threw one
+    /// away would be worse than the mess it was cleaning. Rated topics are left
+    /// alone whatever shape they are in: a rating is work, and work is evidence
+    /// you meant to keep it.
+    @discardableResult
+    func tidyTypedTopics() -> Int {
+        guard let library else { return 0 }
+        var removed = 0
+
+        for url in library.allLectures() {
+            let notesURL = AnkiIdentity.notesURL(for: url)
+            let open = document?.pdfURL == url ? notes : nil
+            let topics: [Topic]
+            if let open {
+                topics = open.topics
+            } else {
+                guard let text = try? String(contentsOf: notesURL, encoding: .utf8)
+                else { continue }
+                topics = TopicBlock.split(text).topics
+            }
+            let doomed = Self.halfTyped(in: topics)
+            guard !doomed.isEmpty else { continue }
+
+            if let open {
+                notesEdit("tidying those topics", on: url) {
+                    for topic in open.topics where doomed.contains(topic.id) {
+                        open.removeTopic(topic)
+                    }
+                }
+                removed += doomed.count
+            } else {
+                removed += (try? TopicBlock.prune(doomed, inFileAt: notesURL)) ?? 0
+            }
         }
+
+        statusMessage = removed == 0
+            ? "No half-typed topics to clear out."
+            : "Cleared \(removed) half-typed topic\(removed == 1 ? "" : "s")."
+        return removed
+    }
+
+    /// The ids of the rungs of every ladder, the top one excepted.
+    static func halfTyped(in topics: [Topic]) -> Set<Topic.ID> {
+        var doomed: Set<Topic.ID> = []
+        let bySection = Dictionary(grouping: topics) { $0.type.lowercased() }
+        for (_, section) in bySection {
+            // Longest first, so the first topic a rung belongs to is the longest
+            // one it is the start of.
+            let sorted = section.sorted { $0.name.count > $1.name.count }
+            for (index, top) in sorted.enumerated() {
+                let full = top.name.lowercased()
+                var rungs: [Topic] = []
+                for other in sorted.dropFirst(index + 1)
+                where other.name.count < top.name.count
+                    && full.hasPrefix(other.name.lowercased())
+                    && !doomed.contains(other.id) {
+                    rungs.append(other)
+                }
+                // Two rungs under the top one makes three topics in the ladder.
+                guard rungs.count >= 2 else { continue }
+
+                // And the rungs have to be a character apart, which is the part
+                // that says "typed" rather than "written". Glycolysis,
+                // Glycolysis regulation and Glycolysis regulation in liver is a
+                // ladder by the prefix test and three topics anyone might keep;
+                // a run of names each one letter longer than the last is not
+                // something a person sits down and writes.
+                let lengths = Set((rungs + [top]).map(\.name.count))
+                for rung in rungs where rung.comfort == .low
+                    && (lengths.contains(rung.name.count - 1)
+                        || lengths.contains(rung.name.count + 1)) {
+                    doomed.insert(rung.id)
+                }
+            }
+        }
+        return doomed
     }
 
     // MARK: Tag filter
@@ -804,6 +907,19 @@ final class AppState: ObservableObject {
         // looks exactly like ⌘N doing nothing at all.
         question.viewTemplateId = panelType.templateId
 
+        // Born with the shape's own tags, and with whatever the list is
+        // filtered to. A template is a kind of card you write over and over,
+        // and the tags that go with it are part of that shape -- re-ticking
+        // "clinical-correlation" on every clinical card is work the template
+        // already knows the answer to. The filter is here for the other half of
+        // the promise: writing under a filter cannot produce a card the filter
+        // then hides.
+        var born = tagFilter
+        if let template = templates.template(id: panelType.templateId) {
+            born.formUnion(template.tags)
+        }
+        question.tags = born.sorted()
+
         // Nothing is attached yet, and the anchor is where you are standing.
         //
         // A new question used to arrive already holding the current slide. That
@@ -838,6 +954,12 @@ final class AppState: ObservableObject {
         commitSignal += 1
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            // After the signal, so the last keystroke is in the model: the
+            // disease you were still typing when you pressed Cmd-Return is the
+            // one that files.
+            if let question = self.document?.question(qid: current.qid) {
+                self.fileTemplateTopics(of: self.adoptTemplate(of: question))
+            }
             self.document?.saveNow()
             // Collapse it. The card folding shut is the "done" -- clearer than
             // any message, and it puts the list back in front of you.
@@ -858,9 +980,143 @@ final class AppState: ObservableObject {
     /// no undo step: being offered a way back to a card you never wrote anything
     /// in is stranger than the card quietly not existing.
     func discard(ifEmpty qid: String) {
-        guard let document, let question = document.question(qid: qid),
-              question.isEmpty else { return }
-        document.delete(qid: qid)
+        guard let document, let question = document.question(qid: qid) else { return }
+        guard !question.isEmpty else {
+            document.delete(qid: qid)
+            return
+        }
+        let filed = adoptTemplate(of: question)
+        fileTemplateTopics(of: filed)
+        settleKind(of: filed)
+    }
+
+    /// A card that turns out to be a template's shape is filed there when you
+    /// are finished with it.
+    ///
+    /// The recognition is the same one the tabs have always used; what is new is
+    /// the moment. Writing "What disease is this patient presenting with?" on
+    /// the Basic tab reaches the CC shape somewhere around the question mark,
+    /// and moving the card then is moving it out from under the hands typing it.
+    /// So the card is marked here instead -- after which `viewTemplateId` holds
+    /// it in that tab for good -- and the panel follows it, because a card
+    /// filing itself somewhere you cannot see it is the same disappearing act
+    /// in a different costume.
+    ///
+    /// Returns the card as it now stands, which the callers go on to use.
+    @discardableResult
+    private func adoptTemplate(of question: Question) -> Question {
+        guard let document, question.kind == .basic, question.viewTemplateId == nil,
+              let match = matchedTemplateId(for: question),
+              let template = templates.template(id: match), template.enabled
+        else { return question }
+
+        var copy = question
+        copy.viewTemplateId = match
+        copy.updatedAt = Date()
+        document.update(copy)
+        statusMessage = "That reads as \(template.name), so it is filed there now."
+
+        // Unless you have already moved on to another card, in which case
+        // dragging the panel after this one would take you away from it.
+        guard focusedQID == nil || focusedQID == copy.qid else { return copy }
+        if panelType != .template(match) { show(.template(match)) }
+        return copy
+    }
+
+    /// The named answers on a template card become topics in the lecture.
+    ///
+    /// A blank says where it files -- `disease` under Dx, `tx` under Tx, `rx`
+    /// under Rx -- and writing the card has already said "this lecture covers
+    /// this". The list fills itself as you work instead of being a second pass
+    /// you do from memory afterwards, which is the pass nobody does.
+    ///
+    /// On leaving the card rather than as you type: a half-typed disease name is
+    /// not a topic, and a list growing a line per keystroke would be unusable.
+    /// A multi-line answer files a topic per line, because that is what a list
+    /// of drugs is. Filed once and then yours: renaming the box afterwards
+    /// leaves the topic alone, since a topic you have rated is no longer a copy
+    /// of the card's wording.
+    private func fileTemplateTopics(of question: Question) {
+        guard let notes, let template = template(for: question) else { return }
+        let values = template.recover(front: question.front, back: question.back) ?? [:]
+        guard !values.isEmpty else { return }
+        let on = template.selectedOptions(inFront: question.front)
+        let live = Set(topicTypes.filter(\.enabled).map { $0.name.lowercased() })
+
+        var filed: [(name: String, type: String)] = []
+        var seen = Set(notes.topics.map(\.id))
+        for blank in template.blanks(options: on) {
+            // A section switched off in Settings is a section you have said you
+            // do not use, so nothing is filed into it.
+            guard let type = blank.filesUnder, live.contains(type.lowercased()) else { continue }
+            for line in (values[blank.key] ?? "").components(separatedBy: .newlines) {
+                var name = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                // The same line read from a card written as a bulleted list.
+                while name.hasPrefix("-") || name.hasPrefix("*") || name.hasPrefix("•") {
+                    name = String(name.dropFirst()).trimmingCharacters(in: .whitespaces)
+                }
+                guard !name.isEmpty, seen.insert(name.lowercased()).inserted else { continue }
+                filed.append((name: name, type: type))
+            }
+        }
+        guard !filed.isEmpty else { return }
+        notesEdit(filed.count == 1 ? "adding that topic" : "adding those topics",
+                  on: notes.pdfURL) {
+            for entry in filed { notes.addTopic(entry.name, type: entry.type) }
+        }
+    }
+
+    /// A card that never became the kind it was opened as becomes a Basic one.
+    ///
+    /// An occlusion card is its regions and a cloze card is its deletions. Leave
+    /// either without them and what you have written is an ordinary card filed
+    /// under a type that cannot export it: the occlusion exporter has no image
+    /// to cut up, and Anki generates no cards at all for a cloze note with no
+    /// `{{c1::}}` in it. Both end as a question you wrote and never see again.
+    ///
+    /// So the kind follows the card rather than the tab it was started in. This
+    /// runs when you leave the card -- clicking away, Cmd-N, switching tabs --
+    /// and not as you type: deciding mid-sentence that a cloze you are halfway
+    /// through writing is really a Basic card would move it out from under you.
+    /// Quitting and closing the lecture settle too, but only as a backstop for
+    /// the card still open at the time; nothing waits on them.
+    private func settleKind(of question: Question) {
+        guard let document else { return }
+        let settled: Bool
+        switch question.kind {
+        case .occlusion: settled = question.masks.isEmpty
+        case .cloze:     settled = Cloze.deletions(in: question.front).isEmpty
+                                   && Cloze.deletions(in: question.back).isEmpty
+        case .basic, .template: return
+        }
+        guard settled else { return }
+
+        var copy = question
+        copy.kind = .basic
+        copy.templateId = nil
+        copy.viewTemplateId = nil
+        copy.updatedAt = Date()
+        document.update(copy)
+
+        statusMessage = question.kind == .occlusion
+            ? "No regions on that card, so it is a Basic one now."
+            : "No cloze deletions on that card, so it is a Basic one now."
+
+        // And you end up where you would have been if you had made a Basic card
+        // in the first place: on the Basic tab with this card open in front of
+        // you, its question row armed. Left on the tab it was made in, the card
+        // vanished from the list the moment it changed kind -- the same
+        // disappearing act as a card filed where you cannot see it.
+        //
+        // Unless you have already gone somewhere. Cmd-N on a card that settles
+        // makes the next card and focuses it in the same breath, and dragging
+        // the panel to Basic then would hide that new card and take the caret
+        // out of it.
+        guard focusedQID == nil || focusedQID == copy.qid else { return }
+        if panelType != .basic { show(.basic) }
+        focusedQID = copy.qid
+        armedRow = defaultArmedRow(for: copy)
+        anchorPage = currentPage
     }
 
     /// The same, for the card open right now.
@@ -869,7 +1125,16 @@ final class AppState: ObservableObject {
     /// comes: quitting, switching away from the app, closing a lecture.
     func discardEmptyFocusedQuestion() {
         guard let qid = focusedQID, let document,
-              let question = document.question(qid: qid), question.isEmpty else { return }
+              let question = document.question(qid: qid) else { return }
+        guard question.isEmpty else {
+            // Not empty, but possibly not the kind it says it is. Quitting is a
+            // way of leaving a card, so it settles here as it would if you had
+            // clicked away from it.
+            let filed = adoptTemplate(of: question)
+            fileTemplateTopics(of: filed)
+            settleKind(of: filed)
+            return
+        }
         document.delete(qid: qid)
         focusedQID = nil
     }
@@ -1359,20 +1624,24 @@ final class AppState: ObservableObject {
 
     var canUndo: Bool {
         if isEditingPDF { return editSession?.canUndo == true }
+        if pdfLedgerLeads { return true }
         if notesLedgerLeads { return true }
         return textUndoAvailable || undoLog?.undoLabel != nil
     }
     var canRedo: Bool {
         if isEditingPDF { return editSession?.canRedo == true }
+        if lastListSurface == .pdf, !pdfMarkRedo.isEmpty { return true }
         if lastListSurface == .notes, notesUndo.canRedo { return true }
         return undoLog?.redoLabel != nil
     }
     var undoLabel: String? {
         if isEditingPDF { return editSession?.undoLabel }
+        if pdfLedgerLeads { return pdfMarkUndo.last?.label }
         return notesLedgerLeads ? notesUndo.undoLabel : undoLog?.undoLabel
     }
     var redoLabel: String? {
         if isEditingPDF { return editSession?.redoLabel }
+        if lastListSurface == .pdf, let step = pdfMarkRedo.last { return step.label }
         if lastListSurface == .notes, notesUndo.canRedo { return notesUndo.redoLabel }
         return undoLog?.redoLabel
     }
@@ -1385,7 +1654,11 @@ final class AppState: ObservableObject {
     /// a checkbox does not move the first responder, so asking AppKit what has
     /// focus would give the wrong answer for exactly the actions this covers.
     /// Whichever list you last changed is the one that gets taken back.
-    enum ListSurface { case questions, notes }
+    /// `pdf` is for marks made with the markup bar *down* -- the highlight
+    /// button, and ⇧⌘H. Those live in the file the moment you make them, and
+    /// the session that made them is closed again in the same breath, so there
+    /// is no edit stack left holding them. This ledger is what ⌘Z finds instead.
+    enum ListSurface { case questions, notes, pdf }
     private(set) var lastListSurface: ListSurface = .questions
     let notesUndo = NotesUndoLog()
     /// Republished so the Edit menu relabels itself; the log is not observable
@@ -1393,6 +1666,89 @@ final class AppState: ObservableObject {
     @Published private(set) var notesUndoTick = 0
 
     private var notesLedgerLeads: Bool { lastListSurface == .notes && notesUndo.canUndo }
+
+    // MARK: Marks made with the markup bar down
+
+    /// One mark, as the two lists that describe it.
+    ///
+    /// Annotations rather than a description of them: the document is not
+    /// re-read when only its marks changed, so these are the same objects that
+    /// are on the page and putting one back is putting *it* back, with its
+    /// colour, its shape and its place intact.
+    private struct PDFMarkStep {
+        let label: String
+        let lecture: URL
+        let added: [(annotation: PDFAnnotation, page: PDFPage)]
+        let removed: [(annotation: PDFAnnotation, page: PDFPage)]
+    }
+
+    private var pdfMarkUndo: [PDFMarkStep] = []
+    private var pdfMarkRedo: [PDFMarkStep] = []
+    private var pdfLedgerLeads: Bool { lastListSurface == .pdf && !pdfMarkUndo.isEmpty }
+
+    /// Forgotten when you open a different lecture: the pages these steps hold
+    /// belong to the document that is being put away.
+    private func forgetPDFMarks() {
+        pdfMarkUndo.removeAll()
+        pdfMarkRedo.removeAll()
+        if lastListSurface == .pdf { lastListSurface = .questions }
+    }
+
+    private func recordPDFMark(_ label: String,
+                               added: [(annotation: PDFAnnotation, page: PDFPage)],
+                               removed: [(annotation: PDFAnnotation, page: PDFPage)]) {
+        guard let lecture = document?.pdfURL else { return }
+        pdfMarkUndo.append(PDFMarkStep(label: label, lecture: lecture,
+                                       added: added, removed: removed))
+        // Twenty is a session's worth. These hold annotations, so a stack that
+        // grew forever would keep every mark you ever took off alive in memory.
+        if pdfMarkUndo.count > 20 { pdfMarkUndo.removeFirst() }
+        pdfMarkRedo.removeAll()
+        lastListSurface = .pdf
+    }
+
+    private func undoPDFMark() {
+        guard let step = pdfMarkUndo.popLast() else { return }
+        guard replayPDFMark(step, reversed: true) else { pdfMarkUndo.append(step); return }
+        pdfMarkRedo.append(step)
+        statusMessage = "Undid \(step.label)."
+    }
+
+    private func redoPDFMark() {
+        guard let step = pdfMarkRedo.popLast() else { return }
+        guard replayPDFMark(step, reversed: false) else { pdfMarkRedo.append(step); return }
+        pdfMarkUndo.append(step)
+        statusMessage = "Redid \(step.label)."
+    }
+
+    /// Puts a step back on the page and writes it, through the same open-use-
+    /// save-close path that made it. The ephemeral session is thrown away, so
+    /// its own stack never competes with this one.
+    private func replayPDFMark(_ step: PDFMarkStep, reversed: Bool) -> Bool {
+        guard document?.pdfURL == step.lecture else { return false }
+        startEditingPDF()
+        guard isEditingPDF, let session = editSession else { return false }
+        let pages = session.pages
+        let put = reversed ? step.removed : step.added
+        let take = reversed ? step.added : step.removed
+        session.perform(step.label,
+                        undo: {
+                            for item in put { pages.remove(item.annotation, from: item.page) }
+                            for item in take { pages.add(item.annotation, to: item.page) }
+                        },
+                        redo: {
+                            for item in take { pages.remove(item.annotation, from: item.page) }
+                            for item in put { pages.add(item.annotation, to: item.page) }
+                        })
+        guard savePDFEdits() else {
+            stopEditingPDF(discardingChanges: true)
+            return false
+        }
+        stopEditingPDF()
+        repaintPDF()
+        textSelectionChanged()
+        return true
+    }
 
     /// Wrap any change to a lecture's topics or questions so it can be taken
     /// back. Records nothing when the change turned out to be a no-op.
@@ -1489,6 +1845,10 @@ final class AppState: ObservableObject {
             statusMessage = "Undid that typing."
             return
         }
+        if pdfLedgerLeads {
+            undoPDFMark()
+            return
+        }
         if notesLedgerLeads {
             undoNotesEdit()
             return
@@ -1509,6 +1869,10 @@ final class AppState: ObservableObject {
             editSession?.redo()
             repaintPDF()
             if let label { statusMessage = "Redid \(label)." }
+            return
+        }
+        if lastListSurface == .pdf, !pdfMarkRedo.isEmpty {
+            redoPDFMark()
             return
         }
         if let responder = NSApp.keyWindow?.firstResponder as? NSText,
@@ -2427,6 +2791,76 @@ final class AppState: ObservableObject {
     func forgetVocabulary() {
         vocabularyCache.removeAll()
         pageTextCache.removeAll()
+        phraseCache = nil
+    }
+
+    // MARK: - Wording you have used before
+
+    /// Every lecture's question wording, read once and kept.
+    ///
+    /// Read off disk rather than held in memory, because the point is the
+    /// lectures you are *not* looking at: the shape of a question you settled on
+    /// three weeks ago is the one worth offering back. Built the first time
+    /// something asks for it rather than on launch, so a library of two hundred
+    /// sidecars costs nothing until you start typing, and thrown away when the
+    /// lecture changes.
+    private var phraseCache: [String]?
+
+    /// What a question field offers as wording: this lecture's questions first,
+    /// then the rest of the library's, commonest first.
+    func questionWordings() -> [String] {
+        if phraseCache == nil { phraseCache = libraryWordings() }
+        var seen = Set<String>()
+        var out: [String] = []
+        for text in liveWordings() + (phraseCache ?? []) {
+            guard seen.insert(text.lowercased()).inserted else { continue }
+            out.append(text)
+        }
+        return out
+    }
+
+    /// A question is worth offering back if it is a sentence rather than a
+    /// fragment, short enough to be a shape rather than an essay, on one line,
+    /// and not a cloze -- whose braces are markup, not wording.
+    private static func wording(of question: Question) -> String? {
+        let text = question.front.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count >= 12, text.count <= 200,
+              !text.contains("\n"), !text.contains("{{c") else { return nil }
+        return text
+    }
+
+    /// The open lecture's, newest first -- a question you wrote a minute ago is
+    /// the likeliest one you are about to write again.
+    private func liveWordings() -> [String] {
+        (document?.questions ?? []).reversed().compactMap(Self.wording(of:))
+    }
+
+    private func libraryWordings() -> [String] {
+        guard let library else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var counts: [String: Int] = [:]
+        var canonical: [String: String] = [:]
+        for url in library.allLectures() where url != document?.pdfURL {
+            let sidecar = url.deletingPathExtension()
+                .appendingPathExtension(AnkiIdentity.sidecarExtension)
+            guard let data = try? Data(contentsOf: sidecar),
+                  let file = try? decoder.decode(SidecarFile.self, from: data) else { continue }
+            for question in file.questions {
+                guard let text = Self.wording(of: question) else { continue }
+                let key = text.lowercased()
+                counts[key, default: 0] += 1
+                if canonical[key] == nil { canonical[key] = text }
+            }
+        }
+        // Commonest first: a shape you have used eight times is the one to
+        // offer when two of them fit. Capped, because past a few hundred the
+        // rest are questions you asked once and will not ask again.
+        return counts.sorted {
+            $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key
+        }
+        .prefix(400)
+        .compactMap { canonical[$0.key] }
     }
 
     func masks(forPage page: Int) -> [Mask] {
@@ -3068,6 +3502,136 @@ final class AppState: ObservableObject {
         }
         repaintPDF()
         return wasFlagged == nil
+    }
+
+    // MARK: The pasteboard
+
+    /// ⌘C, aimed at whichever selection you actually mean.
+    ///
+    /// Text selected on a slide lives in the `PDFView`, and ⌘C only reaches it
+    /// when that view holds the keyboard. It usually does not -- you selected
+    /// with the mouse, and the caret is still in the question you were writing
+    /// -- so the key went down the responder chain, found nobody willing to
+    /// copy, and AppKit beeped.
+    ///
+    /// The field you are typing in wins, but only when something is selected in
+    /// it. A caret sitting in an empty field is not a copy, and the slide behind
+    /// it usually is: selecting on the slide and pasting into the card is the
+    /// flow this whole app is shaped around.
+    func copySelection() {
+        if let responder = NSApp.keyWindow?.firstResponder as? NSText,
+           responder.selectedRange.length > 0 {
+            responder.copy(nil)
+            return
+        }
+        if let text = pdfBox.view.currentSelection?.string,
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            statusMessage = "Copied."
+            return
+        }
+        // Nothing of ours. Let whatever has the keyboard answer for itself.
+        NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
+    }
+
+    // MARK: Highlighting what is selected
+
+    /// Whether there are words selected on the slide, and whether they already
+    /// carry a mark.
+    ///
+    /// Published rather than read on demand, because the PDF view's selection is
+    /// not something SwiftUI watches: the button would be drawn once, with
+    /// whatever was true at the time, and never change again.
+    @Published private(set) var hasTextSelection = false
+    @Published private(set) var selectionIsHighlighted = false
+
+    func textSelectionChanged() {
+        let selection = pdfBox.view.currentSelection
+        let has = selection?.string?
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if hasTextSelection != has { hasTextSelection = has }
+        let marked = has && selection.map { !PDFEditing.highlights(touching: $0).isEmpty } == true
+        if selectionIsHighlighted != marked { selectionIsHighlighted = marked }
+    }
+
+    /// ⇧⌘H, and the button beside Edit PDF. Marks the selected words, or clears
+    /// the marks they already run through.
+    ///
+    /// The same two paths as the flag: one more edit while you are marking up,
+    /// and outside edit mode a session opened, used and closed inside this one
+    /// call, so the tools never appear over the slide you are reading.
+    func toggleHighlightSelection() {
+        // Held before anything else: entering edit mode clears the view's
+        // selection, and by then there would be nothing left to mark.
+        guard let selection = pdfBox.view.currentSelection,
+              selection.string?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        else { return }
+
+        if isEditingPDF {
+            // The session is holding this one; ⌘Z finds it there.
+            guard let marked = applyHighlight(to: selection) else { return }
+            statusMessage = marked ? "Highlighted." : "Highlight removed."
+            return
+        }
+
+        startEditingPDF()
+        guard isEditingPDF, let marked = applyHighlight(to: selection) else {
+            stopEditingPDF(discardingChanges: true)
+            return
+        }
+        guard savePDFEdits() else {
+            stopEditingPDF(discardingChanges: true)
+            return
+        }
+        stopEditingPDF()
+        // Put the words back under the pointer, so clicking again takes the mark
+        // off rather than first making you select them a second time.
+        pdfBox.view.setCurrentSelection(selection, animate: false)
+        textSelectionChanged()
+        if let change = lastHighlightChange {
+            recordPDFMark(marked ? "that highlight" : "removing that highlight",
+                          added: change.added, removed: change.removed)
+            lastHighlightChange = nil
+        }
+        statusMessage = marked ? "Highlighted." : "Highlight removed."
+    }
+
+    /// What the last toggle did, kept so ⌘Z can put it back.
+    private var lastHighlightChange: (added: [(annotation: PDFAnnotation, page: PDFPage)],
+                                      removed: [(annotation: PDFAnnotation, page: PDFPage)])?
+
+    /// Returns whether the selection ended up marked, or nil if there was
+    /// nothing to do.
+    @discardableResult
+    private func applyHighlight(to selection: PDFSelection) -> Bool? {
+        guard let session = editSession else { return nil }
+        let pages = session.pages
+        let existing = PDFEditing.highlights(touching: selection)
+        if !existing.isEmpty {
+            // `shouldDisplay` is deliberately left alone. A highlight is hidden
+            // from PDFKit so this app can draw it; taking it off the page is
+            // what makes it disappear, and setting the flag back would hand it
+            // to PDFKit to paint its own way for a frame.
+            session.perform(existing.count > 1 ? "removing those highlights"
+                                               : "removing that highlight",
+                            undo: { for item in existing { pages.add(item.annotation, to: item.page) } },
+                            redo: { for item in existing { pages.remove(item.annotation, from: item.page) } })
+            repaintPDF()
+            textSelectionChanged()
+            lastHighlightChange = (added: [], removed: existing)
+            return false
+        }
+
+        let made = PDFEditing.marks(for: selection, kind: .highlight, colour: editStroke.nsColor)
+        guard !made.isEmpty else { return nil }
+        session.perform("that highlight",
+                        undo: { for (annotation, page) in made { pages.remove(annotation, from: page) } },
+                        redo: { for (annotation, page) in made { pages.add(annotation, to: page) } })
+        repaintPDF()
+        textSelectionChanged()
+        lastHighlightChange = (added: made, removed: [])
+        return true
     }
 
     // MARK: Page tags

@@ -120,10 +120,19 @@ struct CompletingTextView: NSViewRepresentable {
     var minLines: Int = 2
     var maxLines: Int = 10
     var corpus = SlideCorpus()
-    /// Stock phrases this field offers. Shown while it is empty and matched as
-    /// you type, so a prompt you write on nearly every card of a kind is one
-    /// keystroke rather than four words.
+    /// Stock phrases this field offers, matched as you type -- so a prompt you
+    /// write on nearly every card is one keystroke rather than four words.
     var suggestions: [String] = []
+    /// Whole questions you have written before, matched loosely -- see
+    /// `PhraseBook`. Ordered by how often you have used them.
+    var phrases: [String] = []
+    /// The one offered to a field with nothing in it yet.
+    ///
+    /// Separate from the list because an empty field can only ever show one
+    /// ghost, and picking the first of several would be picking arbitrarily.
+    /// A kind of card with a prompt it nearly always carries names that prompt
+    /// here; everything else waits for a letter to go on.
+    var emptyFieldSuggestion: String?
     var textColour: Color = .primary
 
     func makeNSView(context: Context) -> GhostTextView {
@@ -165,6 +174,8 @@ struct CompletingTextView: NSViewRepresentable {
         view.maxLines = maxLines
         view.corpus = corpus
         view.suggestions = suggestions
+        view.phrases = phrases
+        view.emptyFieldSuggestion = emptyFieldSuggestion
         view.invalidateIntrinsicContentSize()
 
         // Focus is driven from the card, so ⌘N and Tab land in the right field
@@ -235,6 +246,8 @@ final class GhostTextView: NSTextView {
     var ghostColour: NSColor = .placeholderTextColor
     var corpus = SlideCorpus()
     var suggestions: [String] = []
+    var phrases: [String] = []
+    var emptyFieldSuggestion: String?
     var minLines = 2
     var maxLines = 10
 
@@ -262,6 +275,19 @@ final class GhostTextView: NSTextView {
     /// Works out what, if anything, comes next: the rest of the word you are
     /// part-way through, or -- once you are reproducing a phrase -- the next
     /// word of it.
+    /// How much of a stock phrase you have to type before it offers the rest.
+    private static let minimumStockPrefix = 3
+
+    /// How far a set of phrases agree, character for character.
+    private static func commonPrefix(of phrases: [String]) -> String? {
+        guard var shared = phrases.first else { return nil }
+        for phrase in phrases.dropFirst() {
+            shared = String(zip(shared, phrase).prefix { $0.0 == $0.1 }.map(\.0))
+            if shared.isEmpty { return nil }
+        }
+        return shared
+    }
+
     func refreshGhost() {
         let previous = ghost
         ghost = ""
@@ -274,17 +300,42 @@ final class GhostTextView: NSTextView {
         // Stock phrases first, and they are the only thing offered to an empty
         // field: with nothing typed there is no prefix to match a slide word
         // against, but "the prompt you always write here" is knowable anyway.
-        if !suggestions.isEmpty, caret == characters.count {
+        if caret == characters.count {
             let typed = String(characters)
             if typed.isEmpty {
-                ghost = suggestions[0]
+                if let opener = emptyFieldSuggestion { ghost = opener }
                 return
             }
+            // Three letters, not one. A single character is most of the
+            // alphabet's worth of words you might have been starting, and a
+            // whole phrase appearing after "c" is in the way far more often
+            // than it is useful.
+            if typed.count >= Self.minimumStockPrefix {
             let matches = suggestions.filter {
                 $0.count > typed.count && $0.lowercased().hasPrefix(typed.lowercased())
             }
             if matches.count == 1 {
                 ghost = String(matches[0].dropFirst(typed.count))
+                return
+            }
+            // Several still in the running: offer as far as they agree. "C"
+            // against two phrases both starting "Compare" completes to
+            // "Compare" and stops, so ⇧Space can never take a phrase you had
+            // not chosen between yet.
+            if matches.count > 1, let shared = Self.commonPrefix(of: matches),
+               shared.count > typed.count {
+                ghost = String(shared.dropFirst(typed.count))
+                return
+            }
+            }
+
+            // Then the questions you have already written, matched loosely, so
+            // the second "What does X do? What is it a biomarker of?" is three
+            // words and a space bar. After the stock phrases, which are exact
+            // and therefore more certain, and before the slides, whose words
+            // are the ones this cannot know.
+            if let tail = PhraseBook.completion(for: typed, in: phrases) {
+                ghost = tail
                 return
             }
         }

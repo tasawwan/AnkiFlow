@@ -56,6 +56,26 @@ if ! command -v swift >/dev/null 2>&1; then
   exit 1
 fi
 
+# SwiftUI's @State is a macro now, and the plugin that expands it ships inside
+# Xcode -- not in the Command Line Tools. Build against the CLT SDK and every
+# @State in the app silently fails to expand, which arrives as several hundred
+# errors about `self` being immutable, in files you have not touched. The cause
+# is one line of output; it is worth reading it before the compiler does.
+SDK_PATH="$(xcrun --show-sdk-path 2>/dev/null || true)"
+case "$SDK_PATH" in
+  */CommandLineTools/*)
+    echo "Xcode's toolchain isn't selected. This would build against:"
+    echo "    $SDK_PATH"
+    echo
+    echo "SwiftUI's macros aren't in there, so @State would not expand and the"
+    echo "build would fail with hundreds of errors in files you didn't change."
+    echo "Fix it with:"
+    echo "    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+    echo "    rm -rf \"$SOURCE_ROOT/.build\""
+    exit 1
+    ;;
+esac
+
 echo "==> Building (release)…"
 swift build -c release
 

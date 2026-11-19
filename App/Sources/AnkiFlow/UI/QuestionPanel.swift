@@ -380,9 +380,21 @@ struct QuestionCard: View {
             // them, and arming a row the panel never shows would send ⌘E
             // somewhere the exporter never reads.
             // Working in a card takes the slide keys back off the lecture
-            state.armedRow = state.showsBothRows(question)
-                ? (field == .question ? .question : .answer)
-                : state.defaultArmedRow(for: question)
+            // A card written as blanks has one caret for all of them, so the
+            // caret cannot say which side you mean -- every blank reports the
+            // question field, which left the question row armed however far you
+            // tabbed. The shape says instead: "slides on the back" arms the
+            // answer row and keeps it armed while you move between blanks.
+            // Clicking a row still switches it.
+            if let shape = template, shape.kind != .cloze,
+               !Template.keys(in: shape.front).isEmpty
+                || !Template.keys(in: shape.back).isEmpty {
+                state.armedRow = state.defaultArmedRow(for: question)
+            } else {
+                state.armedRow = state.showsBothRows(question)
+                    ? (field == .question ? .question : .answer)
+                    : state.defaultArmedRow(for: question)
+            }
             state.anchorPage = state.anchor(for: question, row: state.armedRow)
         }
         // ⌘⏎. Giving up focus is what pushes a SwiftUI text field's pending
@@ -399,11 +411,11 @@ struct QuestionCard: View {
         // moment the caret lands, and it is the one that has the last word.
         state.armedRow = state.defaultArmedRow(for: question)
         state.anchorPage = state.anchor(for: question, row: state.armedRow)
-        // Go to the slide this question is about. Clicking a question is saying
-        // "I want to work on this one", and working on it means looking at it --
-        // otherwise the first ⌘E or ⌘T lands on whatever slide you happened to
-        // have been reading.
-        if let first = question.allPages.first { state.currentPage = first }
+        // The slides stay where you left them. Opening a card used to jump the
+        // pane to the card's first slide, which moved the page out from under
+        // you every time you opened a card to read or fix its wording -- and
+        // most of the time the slide you were on was the one you wanted. The
+        // button in the card's footer goes there when going there is the point.
         focusedField = .question
     }
 
@@ -563,6 +575,16 @@ struct QuestionCard: View {
     private func templateEditor(_ question: Question, _ template: Template) -> some View {
         let hasBlanks = !Template.keys(in: template.front).isEmpty
             || !Template.keys(in: template.back).isEmpty
+        // A free answer field only when nothing else is writing the back.
+        //
+        // The test used to be the template's own back, which ignored the ticked
+        // questions -- and those write the back too. Tick "How do you treat it?"
+        // on a shape with no back of its own and the Tx and Rx boxes and the
+        // answer field were all editing the same string: typing in Tx rewrote
+        // the answer field under you, and typing in the answer field made the
+        // card unreadable to its own shape, which emptied Tx and Rx.
+        let on = template.selectedOptions(inFront: question.front)
+        let freeAnswer = template.composed(options: on).back.isEmpty
 
         // A cloze shape always edits its sentence directly, blanks or not. The
         // deletions live in that sentence, and a card with no way to make one
@@ -577,14 +599,14 @@ struct QuestionCard: View {
         }
 
         if hasBlanks && template.kind != .cloze {
-            templateFields(template)
+            templateFields(template, tabsToAnswer: freeAnswer)
         } else {
             switch template.kind {
             case .cloze:
                 clozeEditor(question)
             case .occlusion:
                 questionText(placeholder: "Optional — a prompt above the image…",
-                             suggestions: Self.occlusionPrompts)
+                             opener: Self.occlusionPrompts.first)
             case .basic, .template:
                 questionText(placeholder: "Ask the big question…")
             }
@@ -595,11 +617,11 @@ struct QuestionCard: View {
             // No question-slides row, for the same reason a plain occlusion card
             // has none: the image is the answer, and there is nowhere to show a
             // second one.
-            if template.back.isEmpty { backField }
+            if freeAnswer { backField }
             answerRow(question)
             occlusionEditor(question)
         case .cloze:
-            if template.back.isEmpty { backField }
+            if freeAnswer { backField }
             answerRow(question)
         case .basic, .template:
             // Both rows, always -- the same shape a Basic card has.
@@ -611,9 +633,9 @@ struct QuestionCard: View {
             // the exported card. What that setting decides now is which row is
             // *armed* when you arrive, which is the part worth deciding once.
             questionRow(question)
-            // A template with a back of its own writes the answer; only a
-            // front-only template leaves you a field to write it yourself.
-            if template.back.isEmpty { backField }
+            // A template that writes the answer -- its own back, or a ticked
+            // question's -- leaves no field to write it yourself.
+            if freeAnswer { backField }
             answerRow(question)
         }
     }
@@ -631,7 +653,7 @@ struct QuestionCard: View {
             // slide, and a second row would be a place to put a slide that the
             // card has nowhere to show.
             questionText(placeholder: "Optional — a prompt above the image…",
-                             suggestions: Self.occlusionPrompts)
+                             opener: Self.occlusionPrompts.first)
             backField
             answerRow(question)
             occlusionEditor(question)
@@ -644,6 +666,22 @@ struct QuestionCard: View {
 
     private var editorFooter: some View {
         HStack(spacing: 12) {
+            if let page = slideToShow {
+                Button {
+                    state.goToPage(page)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.right.circle")
+                            .font(.system(size: 11))
+                        Text("Slide \(page)")
+                            .font(.system(size: 11.5, design: .monospaced))
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(palette.dim)
+                .help("Show slide \(page)")
+            }
             Spacer()
             Button {
                 state.focusedQID = qid
@@ -657,10 +695,21 @@ struct QuestionCard: View {
         }
     }
 
+    /// The slide the footer button goes to: the first on the side you are
+    /// working on, or the card's first slide when that side has none. The armed
+    /// row rather than the card's first slide throughout, because on a card
+    /// whose answer is slides 12-18 the front's slide 3 is not what "show me
+    /// this card's slide" means while you are writing the back.
+    private var slideToShow: Int? {
+        guard let question = state.document?.question(qid: qid) else { return nil }
+        let armed = state.armedRow == .question ? question.questionPages : question.answerPages
+        return armed.first ?? question.allPages.first
+    }
+
     /// TextField with `axis: .vertical` rather than TextEditor: it grows with the
     /// text, has a real placeholder, and puts the caret where the text actually
     /// starts instead of at the container's top-left corner.
-    private func questionText(placeholder: String, suggestions: [String] = []) -> some View {
+    private func questionText(placeholder: String, opener: String? = nil) -> some View {
         CompletingTextView(
             text: bind(\.front, default: ""),
             focus: focusBinding,
@@ -670,13 +719,25 @@ struct QuestionCard: View {
             fontSize: 15,
             minLines: 2, maxLines: 10,
             corpus: state.completionCorpus(for: question),
-            suggestions: suggestions,
+            suggestions: state.library?.settings.questionPrompts ?? Self.questionPrompts,
+            phrases: state.questionWordings(),
+            emptyFieldSuggestion: opener,
             textColour: palette.ink
         )
     }
 
-    /// What an occlusion prompt nearly always says. Offered as a ghost in the
-    /// empty field, taken with ⇧Space like any other suggestion.
+    /// What the field offers before a library has been opened. The real list
+    /// is in settings, and is yours to grow.
+    ///
+    /// Offered to every kind of card rather than to one, because the question
+    /// you are about to type does not depend on which tab you are standing in.
+    /// Matched as you type rather than ghosted into an empty field: a stem that
+    /// appears before you have decided what to ask is an opinion about your
+    /// card, not an offer.
+    private static let questionPrompts = AppSettings.starterPrompts
+
+    /// What an occlusion prompt nearly always says. That one *is* ghosted into
+    /// the empty field, because an occlusion card almost always asks it.
     private static let occlusionPrompts = ["Label these features"]
 
     /// The written answer. Always present, always optional — Tab from the
@@ -1050,7 +1111,7 @@ struct QuestionCard: View {
     /// disagreeing. Drawing the fields from the text means every blank you can
     /// see is one that will actually go somewhere.
     @ViewBuilder
-    private func templateFields(_ template: Template) -> some View {
+    private func templateFields(_ template: Template, tabsToAnswer: Bool) -> some View {
         let values = question.map { state.blankValues(for: $0, template: template) } ?? [:]
         let on = question.map { template.selectedOptions(inFront: $0.front) } ?? []
         let shape = template.composed(options: on)
@@ -1069,7 +1130,8 @@ struct QuestionCard: View {
 
             ForEach(Array(fields.enumerated()), id: \.element.id) { index, blank in
                 templateBlank(blank, template: template, value: values[blank.key] ?? "",
-                              isFirst: index == 0)
+                              isFirst: index == 0,
+                              tabsToAnswer: tabsToAnswer && index == 0)
             }
         }
     }
@@ -1341,7 +1403,7 @@ struct QuestionCard: View {
     /// non-optional -- so the two cases are separate branches.
     @ViewBuilder
     private func templateBlank(_ blank: TemplateBlank, template: Template,
-                               value: String, isFirst: Bool) -> some View {
+                               value: String, isFirst: Bool, tabsToAnswer: Bool) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text(blank.label.uppercased())
                 .font(AppFont.rowLabel)
@@ -1352,12 +1414,20 @@ struct QuestionCard: View {
                                   axis: blank.multiline ? .vertical : .horizontal)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 13))
-            if isFirst {
+            // Tab goes to the answer field only when there is one. On a shape
+            // that writes its own back there is nothing there to land on, and
+            // Tab was taking the caret out of the card and the armed row with
+            // it; between blanks, Tab is SwiftUI's own and moves to the next.
+            if tabsToAnswer {
                 field.focused($blankFocused)
                     .onKeyPress(.tab) {
                         focusedField = .answer
                         return .handled
                     }
+            } else if isFirst {
+                // Still the card's own focus -- opening one puts the caret
+                // here -- just without the jump out of the card.
+                field.focused($blankFocused)
             } else {
                 field
             }
@@ -1483,20 +1553,39 @@ struct TemplatePreview: View {
     var options: Set<String> = []
 
     var body: some View {
-        Text(attributed)
-            .font(AppFont.question(14.5))
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(palette.panel, in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.line, lineWidth: 1))
+        let shape = template.composed(options: options)
+        VStack(alignment: .leading, spacing: 7) {
+            side("Front", text: shape.front)
+            // Only when the shape writes the answer. A template whose back is a
+            // free field has nothing to preview there that you are not already
+            // looking at in the field itself.
+            if !shape.back.isEmpty { side("Back", text: shape.back) }
+        }
+    }
+
+    /// One side of the card, captioned, so a shape that writes both can be read
+    /// as the two cards it makes rather than only the half you are asked first.
+    private func side(_ label: String, text: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label.uppercased())
+                .font(AppFont.rowLabel)
+                .tracking(0.6)
+                .foregroundStyle(palette.dim)
+            Text(attributed(text))
+                .font(AppFont.question(14.5))
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(palette.panel, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(palette.line, lineWidth: 1))
+        }
     }
 
     /// Filled values are amber and bold; blanks you haven't answered yet show as
     /// a dim rule, so it's obvious what's still missing.
-    private var attributed: AttributedString {
+    private func attributed(_ text: String) -> AttributedString {
         var out = AttributedString()
-        var remainder = Substring(template.composed(options: options).front)
+        var remainder = Substring(text)
 
         while let open = remainder.range(of: "{{"),
               let close = remainder.range(of: "}}", range: open.upperBound..<remainder.endIndex) {

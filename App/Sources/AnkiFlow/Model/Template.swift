@@ -5,14 +5,38 @@ struct TemplateBlank: Codable, Identifiable, Equatable {
     var label: String
     var multiline: Bool
     var optional: Bool
+    /// Which section of the lecture's topic list this blank's answer files
+    /// under, or nil for a blank that files nowhere. Set here only to override
+    /// what the key already implies -- see `filesUnder`.
+    var topicType: String?
 
     var id: String { key }
 
-    init(key: String, label: String? = nil, multiline: Bool = false, optional: Bool = false) {
+    /// Where an answer goes when the template does not say.
+    ///
+    /// Named by the key, because the key is already the name of the thing: a
+    /// blank called `disease` holds a disease wherever it was written, in a
+    /// shape the app ships with or one you wrote this morning. Taking it from
+    /// the key rather than from a setting on each blank means the templates
+    /// already in your file file their answers correctly without being edited.
+    static let topicTypesByKey: [String: String] = [
+        "disease": "Dx", "dx": "Dx", "diagnosis": "Dx", "condition": "Dx",
+        "tx": "Tx", "treatment": "Tx", "management": "Tx",
+        "rx": "Rx", "drug": "Rx", "drugs": "Rx", "med": "Rx", "meds": "Rx"
+    ]
+
+    /// The topic section this blank's answer belongs in, if any.
+    var filesUnder: String? {
+        topicType ?? TemplateBlank.topicTypesByKey[key.lowercased()]
+    }
+
+    init(key: String, label: String? = nil, multiline: Bool = false,
+         optional: Bool = false, topicType: String? = nil) {
         self.key = key
         self.label = label ?? key.capitalized
         self.multiline = multiline
         self.optional = optional
+        self.topicType = topicType
     }
 
     init(from decoder: Decoder) throws {
@@ -21,6 +45,7 @@ struct TemplateBlank: Codable, Identifiable, Equatable {
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? key.capitalized
         multiline = try c.decodeIfPresent(Bool.self, forKey: .multiline) ?? false
         optional = try c.decodeIfPresent(Bool.self, forKey: .optional) ?? false
+        topicType = try c.decodeIfPresent(String.self, forKey: .topicType)
     }
 }
 
@@ -102,10 +127,19 @@ struct Template: Codable, Identifiable, Equatable {
     var enabled: Bool
     /// Extra questions this shape can also ask, each behind a checkbox.
     var options: [TemplateOption] = []
+    /// Which version of a shape the app ships with this is.
+    ///
+    /// The built-ins are written into your file on first launch and the stored
+    /// copy wins from then on, which is what makes them editable -- and what
+    /// left anyone who had run an older build using that build's wording for
+    /// ever. A built-in whose stored copy is older than the one in this version
+    /// is brought up to date once, keeping whether you had switched it off.
+    /// Nothing else reads this, and a shape of your own leaves it at zero.
+    var revision: Int = 0
 
     init(id: String = ULID.generate(), name: String, front: String = "", back: String = "",
          blanks: [TemplateBlank] = [], slides: TemplateSlides = .back, tags: [String] = [],
-         kind: QuestionKind = .basic, enabled: Bool = true,
+         kind: QuestionKind = .basic, enabled: Bool = true, revision: Int = 0,
          options: [TemplateOption] = []) {
         self.id = id
         self.name = name
@@ -116,6 +150,7 @@ struct Template: Codable, Identifiable, Equatable {
         self.tags = tags
         self.kind = kind == .template ? .basic : kind
         self.enabled = enabled
+        self.revision = revision
         self.options = options
     }
 
@@ -132,6 +167,7 @@ struct Template: Codable, Identifiable, Equatable {
         kind = (storedKind == .template ? nil : storedKind) ?? .basic
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         options = try c.decodeIfPresent([TemplateOption].self, forKey: .options) ?? []
+        revision = try c.decodeIfPresent(Int.self, forKey: .revision) ?? 0
     }
 
     /// One of the shapes the app ships with. These can be edited and turned off
@@ -316,21 +352,94 @@ extension Template {
         return out
     }
 
+    /// Literal runs squeezed the way `tidy` squeezes a rendered card.
+    ///
+    /// A pattern is matched against text that has been through `tidy`, which
+    /// collapses blank lines. Take a blank out of the middle of a shape and the
+    /// separators on both sides of where it was come together -- "\n\n" and
+    /// "\n\nTx: " -- so a pattern insisting on four newlines could never match
+    /// the card, which has two.
+    static func squeezed(_ pieces: [Piece]) -> [Piece] {
+        pieces.map { piece in
+            guard case .literal(let text) = piece else { return piece }
+            var out = text
+            while out.contains("\n\n\n") {
+                out = out.replacingOccurrences(of: "\n\n\n", with: "\n\n")
+            }
+            return .literal(out)
+        }
+    }
+
     /// The ways this pattern can legitimately have been filled in.
     ///
-    /// Two: everything present, and the optional blanks left out along with the
-    /// whitespace that was only there to separate them. "How does {{disease}}
-    /// present?" with an optional details blank after it has to recognise both
-    /// the card that has details and the one that does not, and those are two
-    /// different shapes.
+    /// Any blank can be empty -- an optional one because you left it out, any
+    /// other because you ticked "What causes it?" and have not answered it yet --
+    /// and an empty blank renders as nothing at all, taking the whitespace that
+    /// separated it with it. So the readings are this pattern with each
+    /// combination of its blanks taken out, tried in order of how much they
+    /// assume: nothing missing first, then one blank, then two.
+    ///
+    /// It used to try two readings, everything and the optional blanks dropped,
+    /// which meant a card with a ticked question you had not answered yet
+    /// stopped reading back as its own shape -- the fields went blank and typing
+    /// into them did nothing, because the editor will not re-render a card the
+    /// template cannot read.
+    ///
+    /// Ties go to leaving out the optional blanks, and then the later ones:
+    /// "{{disease}}\n\n{{details}}\n\n{{cause}}" written as two paragraphs is
+    /// genuinely ambiguous, and the reading worth preferring is the one where
+    /// what you were asked for is what you wrote.
     static func readings(of text: String, dropping optional: Set<String>) -> [[Piece]] {
-        let full = trimmedEnds(merged(pieces(text)))
-        guard !optional.isEmpty else { return [full] }
-        let reduced = trimmedEnds(merged(pieces(text).filter { piece in
-            if case .blank(let key) = piece { return !optional.contains(key) }
-            return true
-        }))
-        return reduced == full ? [full] : [full, reduced]
+        let base = pieces(text)
+        let keys = base.compactMap { piece -> String? in
+            if case .blank(let key) = piece { return key }
+            return nil
+        }
+        func pattern(dropping drop: Set<String>) -> [Piece] {
+            trimmedEnds(squeezed(merged(base.filter { piece in
+                if case .blank(let key) = piece { return !drop.contains(key) }
+                return true
+            })))
+        }
+        var unique: [String] = []
+        for key in keys where !unique.contains(key) { unique.append(key) }
+
+        // Past a handful of blanks the combinations stop being worth walking,
+        // and a shape that big is not one anyone fills in by halves.
+        guard unique.count <= 6 else {
+            let full = pattern(dropping: [])
+            let reduced = pattern(dropping: optional)
+            return reduced == full ? [full] : [full, reduced]
+        }
+
+        var position: [String: Int] = [:]
+        for (index, key) in unique.enumerated() { position[key] = index }
+        var candidates: [(dropped: Int, required: Int, lateness: Int,
+                          mask: Int, pieces: [Piece])] = []
+        for mask in 0..<(1 << unique.count) {
+            var drop = Set<String>()
+            for (index, key) in unique.enumerated() where mask & (1 << index) != 0 {
+                drop.insert(key)
+            }
+            candidates.append((dropped: drop.count,
+                               required: drop.filter { !optional.contains($0) }.count,
+                               lateness: -drop.reduce(0) { $0 + (position[$1] ?? 0) },
+                               mask: mask,
+                               pieces: pattern(dropping: drop)))
+        }
+        // The mask is in the key only to make the order total: two drop sets
+        // that assume exactly as much as each other have to be tried in the same
+        // order every time, or which blank a card's words land in depends on how
+        // a set happened to be laid out in memory.
+        candidates.sort {
+            ($0.dropped, $0.required, $0.lateness, $0.mask)
+                < ($1.dropped, $1.required, $1.lateness, $1.mask)
+        }
+        var out: [[Piece]] = []
+        for candidate in candidates where !out.contains(candidate.pieces) {
+            out.append(candidate.pieces)
+        }
+        return out
     }
 
     /// How much fixed text this shape pins down. A template that is mostly
@@ -557,23 +666,44 @@ final class TemplateStore: ObservableObject {
             id: Template.builtInPrefix + "cc-disease",
             name: "CC — disease",
             front: "What disease is this patient presenting with?",
-            back: "{{disease}}",
-            blanks: [TemplateBlank(key: "disease", label: "Disease"),
+            // The answer is a named box, not a free field: the disease is the
+            // thing being learnt, so it is worth the app knowing which words on
+            // the card are the disease -- that is what lets it file itself under
+            // Dx in the lecture's topics. The second box is the free one, for
+            // whatever else belongs on the back.
+            back: "{{disease}}\n\n{{details}}",
+            blanks: [TemplateBlank(key: "disease", label: "Disease", topicType: "Dx"),
                      TemplateBlank(key: "details", label: "More details",
                                    multiline: true, optional: true)],
             slides: .front,
             tags: ["clinical-correlation"],
+            revision: 3,
             options: TemplateStore.clinicalOptions
         ),
         Template(
             id: Template.builtInPrefix + "cc-presentation",
             name: "CC — presentation",
-            front: "How does {{disease}} present?\n\n{{details}}",
-            blanks: [TemplateBlank(key: "disease", label: "Disease"),
+            // The extra box is on the back, not here. In the front it sat
+            // between the question and whatever a ticked question added after
+            // it, so a card with nothing in it carried a blank line and a stray
+            // space in the middle of its own question.
+            front: "How does {{disease}} present?",
+            // Named, for the same reason the disease is. An empty back meant the
+            // answer was a free field -- and the moment you ticked "How do you
+            // treat it?" that field and the Tx and Rx boxes were both writing
+            // the back, so what you typed into Tx came out in the answer box.
+            back: "{{presentation}}\n\n{{details}}",
+            // Named here too, though it is on the front: which disease a card is
+            // about is the same fact whichever side you had to type it on, and
+            // it files under Dx from either.
+            blanks: [TemplateBlank(key: "disease", label: "Disease", topicType: "Dx"),
+                     TemplateBlank(key: "presentation", label: "Presentation",
+                                   multiline: true),
                      TemplateBlank(key: "details", label: "More details",
                                    multiline: true, optional: true)],
             slides: .back,
             tags: ["clinical-correlation"],
+            revision: 3,
             options: TemplateStore.clinicalOptions
         )
     ]
@@ -593,8 +723,10 @@ final class TemplateStore: ObservableObject {
         TemplateOption(key: "treat", label: "How do you treat it?",
                        question: "How do you treat it?",
                        answer: "Tx: {{tx}}\nRx: {{rx}}",
-                       blanks: [TemplateBlank(key: "tx", label: "Tx", multiline: true),
-                                TemplateBlank(key: "rx", label: "Rx", multiline: true)])
+                       blanks: [TemplateBlank(key: "tx", label: "Tx", multiline: true,
+                                              topicType: "Tx"),
+                                TemplateBlank(key: "rx", label: "Rx", multiline: true,
+                                              topicType: "Rx")])
     ]
 
     func reload() {
@@ -605,11 +737,29 @@ final class TemplateStore: ObservableObject {
         // never heard of is added back, which is also what makes them
         // undeletable without a rule saying so anywhere else.
         var list = stored
-        for builtIn in Self.builtIns where !list.contains(where: { $0.id == builtIn.id }) {
-            list.append(builtIn)
+        var changed = false
+        for builtIn in Self.builtIns {
+            guard let index = list.firstIndex(where: { $0.id == builtIn.id }) else {
+                list.append(builtIn)
+                changed = true
+                continue
+            }
+            // A stored copy from an older version of the app is replaced by the
+            // shape this version ships, once. Whether you had switched it off is
+            // kept, because that is a decision about your own work rather than
+            // part of the shape; wording you had changed is not, which is the
+            // price of the built-ins ever being able to improve.
+            guard list[index].revision < builtIn.revision else { continue }
+            var updated = builtIn
+            updated.enabled = list[index].enabled
+            list[index] = updated
+            changed = true
         }
         templates = list
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        // Written back, or the same migration runs again on every launch and a
+        // shape you edit afterwards is edited against a file that disagrees.
+        if changed { write(templates) }
     }
 
     /// The tabs: enabled templates only. Turning one off leaves it in the list

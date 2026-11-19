@@ -102,6 +102,12 @@ struct SidebarView: View {
     /// The topic panel's share of the sidebar, draggable like the notes divider
     /// on the other side of the window.
     @State private var topicsHeight: CGFloat = 240
+    /// Whether this view pushed the resize cursor, so the pushes and the pops
+    /// stay in step. `onHover` can report the same state twice -- and during a
+    /// drag the strip moves out from under the pointer -- so pushing without
+    /// checking left the whole app wearing a resize cursor afterwards.
+    @State private var dividerCursorPushed = false
+    @State private var draggingDivider = false
     @State private var topicsDragFrom: CGFloat?
 
     var body: some View {
@@ -208,22 +214,52 @@ struct SidebarView: View {
                     .frame(height: 9)
                     .contentShape(Rectangle())
                     .onHover { inside in
-                        if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+                        setDividerCursor(inside || draggingDivider)
                     }
                     .gesture(
-                        DragGesture()
+                        // Zero minimum, and measured against the window rather
+                        // than against this strip. Both of those were the jerk.
+                        //
+                        // The default 10-point minimum swallows the first ten
+                        // points of the drag and then hands them over all at
+                        // once, so the panel sits still and jumps. And the strip
+                        // itself *moves* as you drag it, so a translation
+                        // measured in its own coordinate space is measured from
+                        // a ruler that is sliding under the pointer -- the
+                        // reading oscillates, and the divider stutters against
+                        // the mouse instead of tracking it.
+                        DragGesture(minimumDistance: 0, coordinateSpace: .global)
                             .onChanged { move in
                                 // Anchored to where the drag started: the
                                 // translation is measured from there, so
                                 // subtracting it from the live height each event
                                 // would compound and the panel would run away.
+                                if topicsDragFrom == nil {
+                                    topicsDragFrom = topicsHeight
+                                    draggingDivider = true
+                                    setDividerCursor(true)
+                                }
                                 let from = topicsDragFrom ?? topicsHeight
-                                if topicsDragFrom == nil { topicsDragFrom = topicsHeight }
-                                topicsHeight = min(560, max(120, from - move.translation.height))
+                                let wanted = from - move.translation.height
+                                // Whole points. A fractional height makes the
+                                // list below it re-lay out onto half-pixels and
+                                // shimmer as you drag.
+                                topicsHeight = (min(560, max(120, wanted))).rounded()
                             }
-                            .onEnded { _ in topicsDragFrom = nil }
+                            .onEnded { _ in
+                                topicsDragFrom = nil
+                                draggingDivider = false
+                            }
                     )
             )
+    }
+
+    /// Push once, pop once. `NSCursor`'s stack is global, so an unbalanced push
+    /// here is an unbalanced push for every other view in the window.
+    private func setDividerCursor(_ wanted: Bool) {
+        guard wanted != dividerCursorPushed else { return }
+        dividerCursorPushed = wanted
+        if wanted { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
     }
 
     private func header(_ library: Library) -> some View {

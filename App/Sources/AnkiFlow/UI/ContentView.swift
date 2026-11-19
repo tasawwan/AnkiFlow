@@ -260,6 +260,7 @@ struct ContentView: View {
                         onHoverMask: { state.hoveredMaskID = $0 },
                         onMaskChanged: { state.setMaskRect($0, to: $1) },
                         onCrop: { page, rect in state.regionDragged(rect, page: page) },
+                        onSelectionChanged: { state.textSelectionChanged() },
                         session: state.editSession,
                         editTool: state.isEditingPDF ? state.editTool : nil,
                         strokeColour: state.editStroke.nsColor,

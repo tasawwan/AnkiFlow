@@ -5,11 +5,34 @@ import QuartzCore
 
 /// Owns the single PDFView instance so the viewer and the thumbnail strip can
 /// both talk to it. PDFThumbnailView drives its host directly, so they have to
+/// The viewer, with one job added: drawing the highlights it has been told to
+/// hide.
+///
+/// It has to happen here and nowhere else. PDFKit hands this method the context
+/// the slide itself is being drawn into, which is the only context a multiply
+/// has anything to multiply *against*. Doing it from the overlay -- a sibling
+/// view sitting over the PDF -- blended the highlight into that view's own
+/// empty backing store, so it came out at full strength and was then laid over
+/// the page as a solid bar.
+final class HighlightingPDFView: PDFView {
+    override func draw(_ page: PDFPage, to context: CGContext) {
+        // Claimed *before* the page is drawn, not after. Taking them over at
+        // load time only covers the ones in the file when it opened; doing it
+        // here covers every one, however it arrived -- drawn a second ago, put
+        // back by an undo, synced in from the iPad -- and does it before PDFKit
+        // gets its turn, so there is never a frame in which PDFKit paints a
+        // highlight its own way.
+        PDFEditing.takeOverHighlights(on: page)
+        super.draw(page, to: context)
+        PDFEditing.drawHighlights(on: page, in: context)
+    }
+}
+
 /// share the same object rather than each making their own.
 @MainActor
 final class PDFViewBox: ObservableObject {
     let view: PDFView = {
-        let view = PDFView()
+        let view = HighlightingPDFView()
         view.autoScales = true
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
@@ -58,6 +81,10 @@ struct PDFPane: NSViewRepresentable {
     /// A region that was dragged or resized on the slide.
     var onMaskChanged: (String, CropRect) -> Void = { _, _ in }
     var onCrop: (Int, CropRect) -> Void = { _, _ in }
+    /// Raised when the words selected on the slide change, so the highlight
+    /// button can light up. PDFKit's selection is not something SwiftUI can
+    /// watch on its own.
+    var onSelectionChanged: () -> Void = { }
     /// The live editing session, or nil when not editing.
     var session: PDFEditSession?
     /// The tool in hand, or nil. Nil keeps the edit overlay invisible to the
@@ -89,6 +116,7 @@ struct PDFPane: NSViewRepresentable {
         // only lit object. Light mode is paper on paper, so it doesn't.
         view.pageShadowsEnabled = palette.pageShadowRadius > 0
         view.document = document
+        context.coordinator.onSelectionChanged = onSelectionChanged
         context.coordinator.attach(to: view)
 
         // The PDFView is shared with the thumbnail strip, so it may already be
@@ -178,6 +206,7 @@ struct PDFPane: NSViewRepresentable {
         }
         container.clipsToBounds = true
         view.clipsToBounds = true
+        context.coordinator.onSelectionChanged = onSelectionChanged
         if view.document !== document {
             // A reload swaps in a new PDFDocument for the same lecture, and
             // PDFKit starts a new document at the top. Where you were reading is
@@ -262,6 +291,7 @@ struct PDFPane: NSViewRepresentable {
         var suppressCallback = false
         var lastReportedPage = 0
         var reloadToken = 0
+        var onSelectionChanged: () -> Void = { }
         weak var overlay: CropOverlayView?
         weak var editOverlay: PDFEditOverlayView?
         private weak var view: PDFView?
@@ -285,6 +315,14 @@ struct PDFPane: NSViewRepresentable {
                 name: .pdfEditSessionDidChange,
                 object: nil
             )
+            NotificationCenter.default.removeObserver(
+                self, name: .PDFViewSelectionChanged, object: nil)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(selectionChanged(_:)),
+                name: .PDFViewSelectionChanged,
+                object: view
+            )
             NotificationCenter.default.removeObserver(self, name: .PDFViewPageChanged, object: nil)
             NotificationCenter.default.addObserver(
                 self,
@@ -292,6 +330,10 @@ struct PDFPane: NSViewRepresentable {
                 name: .PDFViewPageChanged,
                 object: view
             )
+        }
+
+        @objc private func selectionChanged(_ note: Notification) {
+            onSelectionChanged()
         }
 
         @objc private func editSessionChanged(_ note: Notification) {
@@ -968,19 +1010,9 @@ final class CropOverlayView: NSView {
                 convert(pdfView.convert(rect.rect(in: pageBox), from: page), from: pdfView)
             }
 
-            // Highlights, before anything this app draws on top of the slide.
-            // PDFKit has been told not to draw them in its own pass; see
-            // PDFEditing. It still draws them -- here, into a multiplying
-            // context, so the shape is whatever the annotation says it is.
-            let pageRect = convert(pdfView.convert(pageBox, from: page), from: pdfView)
-            if pageBox.width > 0, pageBox.height > 0 {
-                PDFEditing.drawHighlights(on: page) { context in
-                    context.translateBy(x: pageRect.minX, y: pageRect.minY)
-                    context.scaleBy(x: pageRect.width / pageBox.width,
-                                    y: pageRect.height / pageBox.height)
-                    context.translateBy(x: -pageBox.minX, y: -pageBox.minY)
-                }
-            }
+            // Highlights are *not* drawn here. They are drawn by the PDF view
+            // itself, inside its own page drawing, because that is the only
+            // context with the slide in it for the multiply to act on.
 
             // Occlusion masks: filled, because a mask you can see through is a
             // mask you cannot judge. This is roughly what the card will look

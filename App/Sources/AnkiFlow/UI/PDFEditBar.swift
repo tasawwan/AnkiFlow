@@ -51,6 +51,7 @@ struct PDFEditBar: View {
                 tools
             } else {
                 Spacer(minLength: 0)
+                highlightSelectionButton
                 Button {
                     state.startEditingPDF()
                 } label: {
@@ -73,6 +74,39 @@ struct PDFEditBar: View {
         .overlay(alignment: .bottom) {
             Rectangle().fill(palette.line).frame(height: 1)
         }
+    }
+
+    /// Mark the selected words, or clear the marks they run through.
+    ///
+    /// Outside edit mode only. Once the markup bar is up it has a highlighter of
+    /// its own, and two controls for one job in the same row is one too many.
+    ///
+    /// The colour is whatever the markup tools used last, so there is no second
+    /// place to set it and the two can never disagree.
+    private var highlightSelectionButton: some View {
+        Button {
+            state.toggleHighlightSelection()
+        } label: {
+            ZStack(alignment: .bottom) {
+                Image(systemName: "highlighter")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(palette.dim)
+                // The ink it will use, drawn as the nib's own mark.
+                Capsule()
+                    .fill(state.editStroke.color)
+                    .frame(height: 2.5)
+                    .padding(.horizontal, 4)
+            }
+            .frame(width: 27, height: 22)
+        }
+        .buttonStyle(.plain)
+        // Deliberately never dimmed and never disabled. Whether there are words
+        // selected changes several times a second while you read, and a control
+        // that fades in and out at the edge of your eye is worse than one that
+        // simply does nothing when there is nothing to do.
+        .help(state.selectionIsHighlighted
+              ? "Remove the highlight from the selected text (⇧⌘H)"
+              : "Highlight the selected text (⇧⌘H)")
     }
 
     // MARK: - Editing

@@ -192,12 +192,16 @@ struct PageRenderer {
         // and the slide in front of you drifting apart -- which is exactly what
         // had happened: PDFKit drew both, muddily, and fixing only the screen
         // would have left every exported slide looking like the old one.
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
-        // The context is already in page coordinates here -- the same transform
-        // the page itself was drawn with -- so there is nothing to place.
-        PDFEditing.drawHighlights(on: page, box: box) { _ in }
-        NSGraphicsContext.restoreGraphicsState()
+        // Straight into the bitmap the page was just drawn into, and already in
+        // page coordinates, so the multiply has the slide to work against.
+        PDFEditing.drawHighlights(on: page, in: context, box: box)
+
+        // And the text boxes, for the same reason: they are hidden from PDFKit
+        // because the editor draws them itself -- one text box drawn twice is a
+        // smear -- so nothing drew them here at all, and a note you typed onto a
+        // slide was on the slide and missing from the card. Above the highlights
+        // and below the masks, which is the order they are in on screen.
+        PDFEditing.drawTextBoxes(on: page, in: context)
 
         if let masks, !masks.isEmpty {
             // Painted inside the same transform the page was drawn with, in page

@@ -270,6 +270,29 @@ enum TopicBlock {
         return moved
     }
 
+    /// Takes several topics out of a lecture's notes in one write.
+    ///
+    /// By id, because the caller worked out what to drop from the same file it
+    /// is handing back -- and one write rather than one per topic, for the same
+    /// reason `refile` takes the whole set.
+    @discardableResult
+    static func prune(_ ids: Set<Topic.ID>, inFileAt url: URL) throws -> Int {
+        guard !ids.isEmpty,
+              let existing = try? String(contentsOf: url, encoding: .utf8) else { return 0 }
+        var parts = split(existing)
+        let before = parts.topics.count
+        parts.topics.removeAll { ids.contains($0.id) }
+        let removed = before - parts.topics.count
+        guard removed > 0 else { return 0 }
+        let markdown = join(topics: parts.topics, body: parts.body)
+        if markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try? FileManager.default.removeItem(at: url)
+            return removed
+        }
+        try AtomicWrite.write(Data(markdown.utf8), to: url, hidden: false)
+        return removed
+    }
+
     static func remove(_ topic: Topic, inFileAt url: URL) throws {
         try change(topic, inFileAt: url) { $0.remove(at: $1) }
     }

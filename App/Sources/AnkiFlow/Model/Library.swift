@@ -244,6 +244,14 @@ struct AppSettings: Codable, Equatable {
         PageTagDefinition(label: "CC"), PageTagDefinition(label: "HY")
     ]
 
+    /// Ways of asking that come up whatever the lecture is about. Offered as a
+    /// ghost in the question field once you have typed enough of one.
+    var questionPrompts: [String] = AppSettings.starterPrompts
+
+    static let starterPrompts = [
+        "Compare and contrast", "Define these terms", "Label these features"
+    ]
+
     /// What the menu offers. A tag switched off keeps every mark you have
     /// already made -- it is still drawn on the slides that carry it and can
     /// still be taken off -- it just stops being offered for new ones.
@@ -301,6 +309,8 @@ struct AppSettings: Codable, Equatable {
             ?? TopicType.defaults
         pageTags = try c.decodeIfPresent([PageTagDefinition].self, forKey: .pageTags)
             ?? AppSettings.starterPageTags
+        questionPrompts = try c.decodeIfPresent([String].self, forKey: .questionPrompts)
+            ?? AppSettings.starterPrompts
     }
 }
 

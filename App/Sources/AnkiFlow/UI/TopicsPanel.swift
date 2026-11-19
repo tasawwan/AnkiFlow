@@ -204,7 +204,6 @@ private struct LectureTopicList: View {
     /// Show only this section, or all of them when nil.
     var typeFilter: String?
     @State private var entry: [String: String] = [:]
-    @State private var adding: String?
     @FocusState private var entryFocused: String?
 
     /// Every section to draw: the types you have switched on, then any this
@@ -260,7 +259,11 @@ private struct LectureTopicList: View {
             Rectangle().fill(palette.lineSoft).frame(height: 1)
                 .padding(.horizontal, 10)
 
-            if adding == type {
+            // Always, rather than summoned by a plus in the header. A button
+            // at the right-hand end of every section sat under the scroll bar,
+            // and a row that says what it does is a better invitation than a
+            // glyph you have to find.
+            if enabled {
                 entryField(for: type)
             }
 
@@ -327,20 +330,10 @@ private struct LectureTopicList: View {
                 .padding(.horizontal, 5)
                 .overlay(Capsule().stroke(palette.line, lineWidth: 1))
             Spacer(minLength: 4)
-            if enabled {
-                Button {
-                    adding = type
-                    entryFocused = type
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(palette.dim)
-                }
-                .buttonStyle(.plain)
-                .help("Add a topic to \(type)")
-            } else {
-                // No plus: you cannot file anything new under a type you have
-                // switched off, which is the whole meaning of switching it off.
+            if !enabled {
+                // And no add row below it either: you cannot file anything new
+                // under a type you have switched off, which is the whole
+                // meaning of switching it off.
                 Text("OFF")
                     .font(.system(size: 8.5, weight: .semibold))
                     .tracking(0.5)
@@ -384,7 +377,7 @@ private struct LectureTopicList: View {
             .font(.system(size: 12))
             .focused($entryFocused, equals: type)
             .onSubmit { commit(into: type) }
-            .onExitCommand { adding = nil }
+            .onExitCommand { entryFocused = nil }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -399,7 +392,7 @@ private struct LectureTopicList: View {
     private func commit(into type: String) {
         let text = entry[type] ?? ""
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            adding = nil
+            entryFocused = nil
             return
         }
         edit("adding that topic") { notes.addTopic(text, type: type) }

@@ -9,6 +9,7 @@ struct SettingsView: View {
             AppearanceSettings().pane().tabItem { Label("Appearance", systemImage: "circle.lefthalf.filled") }
             TagSettings().pane().tabItem { Label("Tags", systemImage: "tag") }
             PageTagSettings().pane().tabItem { Label("Slide Tags", systemImage: "flag") }
+            PromptSettings().pane().tabItem { Label("Prompts", systemImage: "text.cursor") }
             TopicTypeSettings().pane().tabItem { Label("Topics", systemImage: "list.bullet") }
             RenderingSettings().pane().tabItem { Label("Rendering", systemImage: "photo") }
             ExportSettings().pane().tabItem { Label("Export", systemImage: "square.and.arrow.up") }
@@ -254,6 +255,79 @@ struct TagSettings: View {
 }
 
 // MARK: - Rendering
+
+/// The stock ways of asking a question, offered as you type.
+struct PromptSettings: View {
+    @EnvironmentObject var state: AppState
+    @State private var newPrompt = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Type the first few letters of one of these in a question field and the rest appears in grey. ⇧Space takes it; keep typing to ignore it. The same list is offered on every kind of card.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let library = state.library {
+                List {
+                    ForEach(Array(library.settings.questionPrompts.enumerated()),
+                            id: \.offset) { index, prompt in
+                        HStack(spacing: 10) {
+                            Text(prompt)
+                                .font(.system(size: 13))
+                            Spacer(minLength: 0)
+                            Button {
+                                library.settings.questionPrompts.remove(at: index)
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 9, weight: .semibold))
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 1)
+                    }
+                    .onMove { source, destination in
+                        library.settings.questionPrompts.move(fromOffsets: source,
+                                                              toOffset: destination)
+                    }
+                }
+                .listStyle(.inset)
+                .frame(minHeight: 170)
+
+                HStack(spacing: 8) {
+                    TextField("Add a prompt — “What is the mechanism of”…", text: $newPrompt)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { add(library) }
+                    Button("Add") { add(library) }
+                        .disabled(tidied.count < 3
+                                  || library.settings.questionPrompts.contains(tidied))
+                }
+
+                Text("Three letters before one shows itself, so very short prompts are not worth adding — by the time you have typed enough to pick one out you have typed the whole thing. Two that start alike are fine: the grey text stops where they stop agreeing, so ⇧Space can never take the one you had not chosen yet.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Open a library first — prompts are per library.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(20)
+    }
+
+    private var tidied: String {
+        newPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func add(_ library: Library) {
+        let prompt = tidied
+        guard prompt.count >= 3,
+              !library.settings.questionPrompts.contains(prompt) else { return }
+        library.settings.questionPrompts.append(prompt)
+        newPrompt = ""
+    }
+}
 
 /// The short labels you can put on a slide, beside the flag.
 ///
